@@ -1,0 +1,2363 @@
+#!/usr/bin/env bash
+# wsl-code-manager / wcm
+# wcm installed: manager
+
+set -u
+
+VERSION="1.0"
+INSTALL_DIR="${WCM_INSTALL_DIR:-$HOME/.local/bin}"
+MANAGER_NAME="wsl-code-manager"
+SHORT_NAME="wcm"
+MARKER="wcm installed"
+LEGACY_MARKER="wcm managed"
+REMOTE_DEVELOPMENT_EXT_ID="ms-vscode-remote.vscode-remote-extensionpack"
+REMOTE_WSL_EXT_ID="ms-vscode-remote.remote-wsl"
+MARKETPLACE_BASE_URL="https://marketplace.visualstudio.com/_apis/public/gallery"
+CACHE_DIR="${WCM_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/wsl-code-manager}"
+RECORD_CACHE="$CACHE_DIR/editors.tsv"
+VERSION_CACHE="$CACHE_DIR/version"
+
+PRODUCT_CACHE=""
+REGISTRY_CACHE=""
+
+cleanup() {
+    [ -n "$PRODUCT_CACHE" ] && [ -f "$PRODUCT_CACHE" ] && rm -f "$PRODUCT_CACHE"
+    [ -n "$REGISTRY_CACHE" ] && [ -f "$REGISTRY_CACHE" ] && rm -f "$REGISTRY_CACHE"
+}
+trap cleanup EXIT
+
+say() {
+    printf '%s\n' "$*"
+}
+
+lower() {
+    tr '[:upper:]' '[:lower:]'
+}
+
+normalize_words() {
+    local value="${1,,}"
+    local words
+
+    value=${value//[![:alnum:]]/ }
+    read -r -a words <<< "$value"
+    printf '%s\n' "${words[*]}"
+}
+
+phrase_in_words() {
+    local hay
+    local needle
+
+    hay=$(normalize_words "$1")
+    needle=$(normalize_words "$2")
+    [ -n "$needle" ] || return 1
+
+    case " $hay " in
+        *" $needle "*) return 0 ;;
+    esac
+
+    return 1
+}
+
+json_get() {
+    local key="$1"
+    local file="$2"
+
+    [ -f "$file" ] || return 0
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$key" "$file" <<'PY' 2>/dev/null
+import json
+import sys
+
+key = sys.argv[1]
+path = sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    value = data.get(key, "")
+    if isinstance(value, str):
+        print(value)
+except Exception:
+    pass
+PY
+        return 0
+    fi
+
+    sed -nE 's/^[[:space:]]*"'"$key"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$file" | head -n 1
+}
+
+json_get_remote_wsl_replacement() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$file" <<'PY' 2>/dev/null
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    value = data.get("extensionReplacementMapForImports", {}).get("ms-vscode-remote.remote-wsl", "")
+    if isinstance(value, str):
+        print(value)
+except Exception:
+    pass
+PY
+    fi
+}
+
+read_launcher_value() {
+    local key="$1"
+    local file="$2"
+
+    [ -f "$file" ] || return 0
+    grep "^${key}=" "$file" 2>/dev/null | head -n 1 | cut -d'"' -f2
+}
+
+candidate_defaults() {
+    cat <<'EOF'
+vscode|VS Code|code|Code|.vscode|.vscode-server|Microsoft VS Code;Visual Studio Code;VSCode
+cursor|Cursor|cursor|Cursor|.cursor|.cursor-server|Cursor
+trae|Trae|trae|Trae|.trae|.trae-server|Trae
+qoder|Qoder|qoder|Qoder|.qoder|.qoder-server|Qoder
+qodercn|QoderCN|qoder-cn|QoderCN|.qoder-cn|.qoder-cn-server|QoderCN;Qoder CN
+codearts|CodeArts Agent|codearts-agent|codearts-agent|.codearts-doer-for-coding|.codearts-doer-for-coding-server|CodeArts Agent;codearts-agent
+codebuddy|CodeBuddy|codebuddy|CodeBuddy|.codebuddy|.codebuddy-server|CodeBuddy;Tencent Cloud CodeBuddy
+devin|Devin Desktop|devin-desktop|Devin|.windsurf|.windsurf-server|Devin Desktop;Devin;Windsurf;Codeium
+kiro|Kiro|kiro|Kiro|.kiro|.kiro-server|Kiro;AWS Kiro
+void|Void|void|Void|.void|.void-server|Void
+pearai|PearAI|pearai|PearAI|.pearai|.pearai-server|PearAI;Pear AI
+vscodium|VSCodium|codium|VSCodium|.vscode-oss|.vscode-server-oss|VSCodium;Codium
+EOF
+}
+
+known_bases() {
+    local id="$1"
+
+    case "$id" in
+        vscode)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Microsoft\ VS\ Code /mnt/c/Program\ Files/Microsoft\ VS\ Code /mnt/c/Program\ Files\ \(x86\)/Microsoft\ VS\ Code; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        cursor)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Cursor /mnt/c/Program\ Files/Cursor /mnt/c/Program\ Files\ \(x86\)/Cursor; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        trae)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Trae /mnt/c/Program\ Files/Trae /mnt/c/Program\ Files\ \(x86\)/Trae; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        qoder)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Qoder /mnt/c/Program\ Files/Qoder /mnt/c/Program\ Files\ \(x86\)/Qoder; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        qodercn)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/QoderCN /mnt/c/Program\ Files/QoderCN /mnt/c/Program\ Files\ \(x86\)/QoderCN; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        codearts)
+            for p in /mnt/c/Program\ Files/CodeArts\ Agent /mnt/c/Program\ Files\ \(x86\)/CodeArts\ Agent /mnt/c/Users/*/AppData/Local/Programs/CodeArts\ Agent; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        codebuddy)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/CodeBuddy /mnt/c/Program\ Files/CodeBuddy /mnt/c/Program\ Files/Tencent/CodeBuddy /mnt/c/Program\ Files\ \(x86\)/CodeBuddy; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        devin)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Devin /mnt/c/Users/*/AppData/Local/Programs/Devin\ Desktop /mnt/c/Users/*/AppData/Local/Programs/Windsurf /mnt/c/Program\ Files/Devin /mnt/c/Program\ Files/Devin\ Desktop /mnt/c/Program\ Files/Windsurf /mnt/c/Program\ Files\ \(x86\)/Devin /mnt/c/Program\ Files\ \(x86\)/Devin\ Desktop /mnt/c/Program\ Files\ \(x86\)/Windsurf; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        kiro)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Kiro /mnt/c/Program\ Files/Kiro /mnt/c/Program\ Files\ \(x86\)/Kiro; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        void)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/Void /mnt/c/Program\ Files/Void /mnt/c/Program\ Files\ \(x86\)/Void; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        pearai)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/PearAI /mnt/c/Program\ Files/PearAI /mnt/c/Program\ Files\ \(x86\)/PearAI; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+        vscodium)
+            for p in /mnt/c/Users/*/AppData/Local/Programs/VSCodium /mnt/c/Program\ Files/VSCodium /mnt/c/Program\ Files\ \(x86\)/VSCodium; do
+                [ -d "$p" ] && printf '%s\n' "$p"
+            done
+            ;;
+    esac
+}
+
+build_product_cache() {
+    [ -n "$PRODUCT_CACHE" ] && [ -f "$PRODUCT_CACHE" ] && return 0
+
+    PRODUCT_CACHE=$(mktemp "${TMPDIR:-/tmp}/wcm-products.XXXXXX")
+    : > "$PRODUCT_CACHE"
+
+    [ "${WCM_DEEP_SCAN:-0}" = "1" ] || return 0
+
+    for root in /mnt/c/Users/*/AppData/Local/Programs /mnt/c/Program\ Files /mnt/c/Program\ Files\ \(x86\); do
+        [ -d "$root" ] || continue
+        find "$root" -maxdepth 7 -path '*/resources/app/product.json' -type f -print 2>/dev/null
+    done | sort -u > "$PRODUCT_CACHE"
+}
+
+windows_reg_query() {
+    local key="$1"
+
+    if [ -x /init ] && [ -x /mnt/c/Windows/System32/reg.exe ]; then
+        /init /mnt/c/Windows/System32/reg.exe -- query "$key" /s 2>/dev/null </dev/null
+        return $?
+    fi
+
+    if command -v reg.exe >/dev/null 2>&1; then
+        reg.exe query "$key" /s 2>/dev/null </dev/null
+    fi
+}
+
+build_registry_cache() {
+    local root
+
+    [ -n "$REGISTRY_CACHE" ] && [ -f "$REGISTRY_CACHE" ] && return 0
+
+    REGISTRY_CACHE=$(mktemp "${TMPDIR:-/tmp}/wcm-registry.XXXXXX")
+    : > "$REGISTRY_CACHE"
+
+    for root in \
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall' \
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall' \
+        'HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    do
+        windows_reg_query "$root" | tr -d '\r' | LC_ALL=C awk '
+            function clean(value) {
+                gsub(/\t/, " ", value)
+                return value
+            }
+            function flush() {
+                if (key == "") {
+                    return
+                }
+                if (install == "" && app_path != "") {
+                    install = app_path
+                }
+                if (display != "" || install != "" || icon != "") {
+                    printf "%s\t%s\t%s\t%s\n", clean(display), clean(install), clean(icon), clean(key)
+                }
+            }
+            /^HKEY/ {
+                flush()
+                key = $0
+                display = ""
+                install = ""
+                app_path = ""
+                icon = ""
+                next
+            }
+            /^[[:space:]]+/ {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (match(line, /[[:space:]]+REG_(SZ|EXPAND_SZ)[[:space:]]+/)) {
+                    name = substr(line, 1, RSTART - 1)
+                    value = substr(line, RSTART + RLENGTH)
+                    if (name == "DisplayName") {
+                        display = value
+                    } else if (name == "InstallLocation") {
+                        install = value
+                    } else if (name == "Inno Setup: App Path") {
+                        app_path = value
+                    } else if (name == "DisplayIcon") {
+                        icon = value
+                    }
+                }
+            }
+            END {
+                flush()
+            }
+        ' >> "$REGISTRY_CACHE"
+    done
+}
+
+clean_windows_path_value() {
+    local value="$1"
+
+    value=${value//$'\r'/}
+    value=${value%%,0}
+    value=${value#\"}
+    value=${value%%\"*}
+    value=${value%\\}
+    printf '%s\n' "$value"
+}
+
+windows_path_to_wsl() {
+    local win_path="$1"
+
+    [ -n "$win_path" ] || return 0
+
+    if command -v wslpath >/dev/null 2>&1; then
+        wslpath -u "$win_path" 2>/dev/null && return 0
+    fi
+
+    case "$win_path" in
+        [A-Za-z]:\\*)
+            local drive
+            local rest
+            drive=$(printf '%s\n' "${win_path%%:*}" | lower)
+            rest=${win_path#?:\\}
+            rest=${rest//\\//}
+            printf '/mnt/%s/%s\n' "$drive" "$rest"
+            ;;
+    esac
+}
+
+registry_matches_candidate() {
+    local display_name="$1"
+    local install_win="$2"
+    local icon_win="$3"
+    local key="$4"
+    local app_default="$5"
+    local display="$6"
+    local aliases="$7"
+    local hay
+    local alias
+    local alias_parts
+
+    hay="${display_name,,} ${install_win,,} ${icon_win,,} ${key,,}"
+
+    IFS=';' read -r -a alias_parts <<< "${aliases};${display}"
+    for alias in "${alias_parts[@]}"; do
+        [ -z "$alias" ] && continue
+        alias=${alias,,}
+        case "$hay" in
+            *"$alias"*) return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+registry_bases_for_candidate() {
+    local app_default="$1"
+    local display="$2"
+    local aliases="$3"
+    local display_name
+    local install_win
+    local icon_win
+    local key
+    local base_win
+    local base_wsl
+
+    build_registry_cache
+
+    while IFS=$'\t' read -r display_name install_win icon_win key; do
+        registry_matches_candidate "$display_name" "$install_win" "$icon_win" "$key" "$app_default" "$display" "$aliases" || continue
+
+        base_win=$(clean_windows_path_value "$install_win")
+        if [ -z "$base_win" ]; then
+            base_win=$(clean_windows_path_value "$icon_win")
+            case "$base_win" in
+                *.exe|*.EXE) base_win=${base_win%\\*} ;;
+            esac
+        fi
+
+        base_wsl=$(windows_path_to_wsl "$base_win")
+        [ -n "$base_wsl" ] && [ -d "$base_wsl" ] && printf '%s\n' "$base_wsl"
+    done < "$REGISTRY_CACHE" | sort -u
+}
+
+product_under_base() {
+    local base="$1"
+    local product
+
+    for product in "$base/resources/app/product.json" "$base"/*/resources/app/product.json; do
+        [ -f "$product" ] && printf '%s\n' "$product" && return 0
+    done
+
+    find "$base" -maxdepth 6 -path '*/resources/app/product.json' -type f -print 2>/dev/null | head -n 1
+}
+
+product_matches_candidate() {
+    local product="$1"
+    local app_default="$2"
+    local display="$3"
+    local aliases="$4"
+
+    local app
+    local name_short
+    local name_long
+    local win_dir
+    local hay
+    local alias
+    local alias_norm
+    local field
+
+    app=$(json_get applicationName "$product")
+    name_short=$(json_get nameShort "$product")
+    name_long=$(json_get nameLong "$product")
+    win_dir=$(json_get win32DirName "$product")
+    hay="$app $name_short $name_long $win_dir $product"
+
+    [ "$app" = "$app_default" ] && return 0
+
+    IFS=';' read -r -a alias_parts <<< "${aliases};${display}"
+    for alias in "${alias_parts[@]}"; do
+        [ -z "$alias" ] && continue
+        alias_norm=$(normalize_words "$alias")
+        [ -n "$alias_norm" ] || continue
+
+        if [[ "$alias_norm" != *" "* ]]; then
+            for field in "$app" "$name_short" "$name_long" "$win_dir"; do
+                [ "$(normalize_words "$field")" = "$alias_norm" ] && return 0
+            done
+            continue
+        fi
+
+        phrase_in_words "$hay" "$alias" && return 0
+    done
+
+    return 1
+}
+
+wsl_command_for_product() {
+    local id="$1"
+    local app_default="$2"
+    local real_app="$3"
+
+    case "$id" in
+        devin)
+            printf '%s\n' "$app_default"
+            ;;
+        *)
+            printf '%s\n' "${real_app:-$app_default}"
+            ;;
+    esac
+}
+
+discover_product() {
+    local id="$1"
+    local app_default="$2"
+    local display="$3"
+    local aliases="$4"
+    local base
+    local product
+
+    while IFS= read -r base; do
+        [ -n "$base" ] || continue
+        product=$(product_under_base "$base")
+        if [ -n "$product" ] && product_matches_candidate "$product" "$app_default" "$display" "$aliases"; then
+            printf '%s\n' "$product"
+            return 0
+        fi
+    done < <(registry_bases_for_candidate "$app_default" "$display" "$aliases")
+
+    while IFS= read -r base; do
+        [ -n "$base" ] || continue
+        product=$(product_under_base "$base")
+        [ -n "$product" ] && printf '%s\n' "$product" && return 0
+    done < <(known_bases "$id")
+
+    build_product_cache
+    while IFS= read -r product; do
+        product_matches_candidate "$product" "$app_default" "$display" "$aliases" && printf '%s\n' "$product" && return 0
+    done < "$PRODUCT_CACHE"
+}
+
+install_path_for_product() {
+    local product="$1"
+    local app="$2"
+    local d
+
+    d=$(dirname "$product")
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+        if [ -e "$d/bin/$app" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+default_windows_profile() {
+    local d
+
+    for d in /mnt/c/Users/*; do
+        [ -d "$d" ] || continue
+        case "$(basename "$d")" in
+            Public|Default|Default\ User|All\ Users) continue ;;
+        esac
+        printf '%s\n' "$d"
+        return 0
+    done
+}
+
+windows_profile_for() {
+    local install_path="$1"
+    local data_folder="$2"
+    local d
+
+    case "$install_path" in
+        /mnt/*/Users/*/*)
+            printf '%s\n' "$install_path" | sed -E 's#^(/mnt/[^/]+/Users/[^/]+)/.*#\1#'
+            return 0
+            ;;
+    esac
+
+    for d in /mnt/c/Users/*; do
+        [ -d "$d/$data_folder" ] && printf '%s\n' "$d" && return 0
+    done
+
+    default_windows_profile
+}
+
+remote_wsl_extension_ids() {
+    local product="${1:-}"
+    local replacement
+
+    replacement=$(json_get_remote_wsl_replacement "$product")
+    if [ -n "$replacement" ] && [ "$replacement" != "$REMOTE_WSL_EXT_ID" ]; then
+        printf '%s\n' "$replacement"
+    fi
+    printf '%s\n' "$REMOTE_WSL_EXT_ID"
+}
+
+remote_wsl_extension_id_words() {
+    local product="${1:-}"
+
+    remote_wsl_extension_ids "$product" | paste -sd ' ' -
+}
+
+latest_remote_wsl_extension() {
+    local profile="$1"
+    local data_folder="$2"
+    local product="${3:-}"
+    local ext_dir="$profile/$data_folder/extensions"
+    local ext_id
+    local found
+
+    while IFS= read -r ext_id; do
+        [ -n "$ext_id" ] || continue
+        found=$(find "$ext_dir" -maxdepth 1 -type d -name "$ext_id*" -print 2>/dev/null | sort -V | tail -n 1)
+        if [ -n "$found" ]; then
+            printf '%s\n' "$found"
+            return 0
+        fi
+    done < <(remote_wsl_extension_ids "$product")
+}
+
+realpath_or_empty() {
+    local path="$1"
+    [ -n "$path" ] && [ -e "$path" ] && realpath "$path" 2>/dev/null
+}
+
+is_wcm_file() {
+    local path="$1"
+    [ -e "$path" ] || return 1
+    grep -q "$MARKER" "$path" 2>/dev/null || grep -q "$LEGACY_MARKER" "$path" 2>/dev/null
+}
+
+first_path_for_command() {
+    local app="$1"
+    command -v "$app" 2>/dev/null || true
+}
+
+wrapper_state() {
+    local app="$1"
+    local wrapper="$INSTALL_DIR/$app"
+    local first
+    local first_real
+    local wrapper_real
+    local flavor
+    local priority="no"
+
+    if [ ! -e "$wrapper" ]; then
+        printf 'no'
+        return 0
+    fi
+
+    if is_wcm_file "$wrapper"; then
+        flavor="installed"
+    else
+        flavor="custom"
+    fi
+
+    first=$(first_path_for_command "$app")
+    first_real=$(realpath_or_empty "$first")
+    wrapper_real=$(realpath_or_empty "$wrapper")
+    [ -n "$first_real" ] && [ "$first_real" = "$wrapper_real" ] && priority="path"
+
+    if [ "$priority" = "path" ]; then
+        printf '%s' "$flavor"
+    else
+        printf '%s/not-first' "$flavor"
+    fi
+}
+
+helper_state() {
+    local app="$1"
+    local helper="$INSTALL_DIR/$app-wsl-client"
+
+    if [ ! -e "$helper" ]; then
+        printf 'no'
+        return 0
+    fi
+
+    if is_wcm_file "$helper"; then
+        printf 'installed'
+    else
+        printf 'custom'
+    fi
+}
+
+extension_id_name() {
+    local ext_id="$1"
+    printf '%s\n' "${ext_id#*.}"
+}
+
+extension_id_publisher() {
+    local ext_id="$1"
+    printf '%s\n' "${ext_id%%.*}"
+}
+
+marketplace_vsix_url() {
+    local ext_id="$1"
+    local publisher
+    local name
+
+    publisher=$(extension_id_publisher "$ext_id")
+    name=$(extension_id_name "$ext_id")
+    printf '%s/publishers/%s/vsextensions/%s/latest/vspackage\n' "$MARKETPLACE_BASE_URL" "$publisher" "$name"
+}
+
+editor_cli_path() {
+    local install_path="$1"
+    local launcher="$2"
+    local versionfolder
+
+    versionfolder=$(read_launcher_value VERSIONFOLDER "$launcher")
+    if [ -n "$versionfolder" ] && [ -f "$install_path/$versionfolder/resources/app/out/cli.js" ]; then
+        printf '%s\n' "$install_path/$versionfolder/resources/app/out/cli.js"
+        return 0
+    fi
+
+    if [ -f "$install_path/out/cli.js" ]; then
+        printf '%s\n' "$install_path/out/cli.js"
+        return 0
+    fi
+
+    printf '%s\n' "$install_path/resources/app/out/cli.js"
+}
+
+electron_path_for_launcher() {
+    local install_path="$1"
+    local launcher="$2"
+    local exe="$3"
+    local name
+    local candidate
+    local search_dir
+
+    name=$(read_launcher_value NAME "$launcher")
+
+    for candidate in "$name" "$exe"; do
+        [ -n "$candidate" ] || continue
+
+        search_dir=$(dirname "$(realpath "$launcher")")
+        while [ "$search_dir" != "/" ] && [ -n "$search_dir" ]; do
+            if [ -f "$search_dir/$candidate.exe" ]; then
+                printf '%s\n' "$search_dir/$candidate.exe"
+                return 0
+            fi
+            search_dir=$(dirname "$search_dir")
+        done
+
+        if [ -f "$install_path/$candidate.exe" ]; then
+            printf '%s\n' "$install_path/$candidate.exe"
+            return 0
+        fi
+    done
+}
+
+run_windows_editor_cli() {
+    local install_path="$1"
+    local launcher="$2"
+    local exe="$3"
+    shift 3
+
+    local electron
+    local cli
+    local cli_win
+
+    electron=$(electron_path_for_launcher "$install_path" "$launcher" "$exe")
+    cli=$(editor_cli_path "$install_path" "$launcher")
+    if [ ! -f "$cli" ]; then
+        say "Error: Cannot find editor CLI: $cli" >&2
+        return 1
+    fi
+
+    if [ ! -f "$electron" ]; then
+        say "Error: Cannot find editor executable: $electron" >&2
+        return 1
+    fi
+
+    if ! command -v wslpath >/dev/null 2>&1; then
+        say "Error: wslpath is required to install Windows-side extensions." >&2
+        return 1
+    fi
+
+    cli_win=$(wslpath -m "$cli")
+
+    if [ -x /init ]; then
+        WSLENV="ELECTRON_RUN_AS_NODE/w:${WSLENV:-}" \
+        ELECTRON_RUN_AS_NODE=1 \
+        /init "$electron" -- "$cli_win" "$@"
+        return $?
+    fi
+
+    WSLENV="ELECTRON_RUN_AS_NODE/w:${WSLENV:-}" \
+    ELECTRON_RUN_AS_NODE=1 \
+    "$electron" "$cli_win" "$@"
+}
+
+download_vsix_to_windows_temp() {
+    local ext_id="$1"
+    local profile="$2"
+    local url
+    local out_dir
+    local out_file
+    local safe_name
+
+    if ! command -v curl >/dev/null 2>&1; then
+        say "Error: curl is required to download VSIX fallback." >&2
+        return 1
+    fi
+
+    safe_name=$(printf '%s\n' "$ext_id" | tr '.:' '--')
+    out_dir="$profile/AppData/Local/Temp/wcm-vsix"
+    out_file="$out_dir/$safe_name-latest.vsix"
+    url=$(marketplace_vsix_url "$ext_id")
+
+    mkdir -p "$out_dir"
+    say "Downloading VSIX: $ext_id" >&2
+    say "Source: $url" >&2
+
+    curl --compressed -fsSL --connect-timeout 15 --max-time 180 -o "$out_file" "$url" || return 1
+
+    if command -v unzip >/dev/null 2>&1; then
+        if ! unzip -t "$out_file" >/dev/null 2>&1; then
+            say "Error: Downloaded VSIX is not a valid zip archive: $out_file" >&2
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$out_file"
+}
+
+install_extension_id_or_vsix() {
+    local display="$1"
+    local install_path="$2"
+    local launcher="$3"
+    local exe="$4"
+    local profile="$5"
+    local ext_id="$6"
+    local vsix_path
+    local vsix_win
+
+    say "Installing $ext_id into Windows-side $display..."
+    if run_windows_editor_cli "$install_path" "$launcher" "$exe" --install-extension "$ext_id" --force; then
+        return 0
+    fi
+
+    say "Extension ID install failed for $ext_id; falling back to VSIX download."
+    vsix_path=$(download_vsix_to_windows_temp "$ext_id" "$profile") || return 1
+    vsix_win=$(wslpath -m "$vsix_path")
+
+    run_windows_editor_cli "$install_path" "$launcher" "$exe" --install-extension "$vsix_win" --force
+}
+
+ensure_remote_wsl_extension() {
+    local display="$1"
+    local install_path="$2"
+    local launcher="$3"
+    local exe="$4"
+    local data="$5"
+    local profile="$6"
+    local product="$7"
+    local ext
+    local remote_ext_id
+
+    ext=$(latest_remote_wsl_extension "$profile" "$data" "$product")
+    if [ -n "$ext" ]; then
+        say "Remote WSL extension already installed for $display."
+        return 0
+    fi
+
+    say "Remote WSL extension missing for $display."
+    say "Installing Remote Development extension pack first..."
+    install_extension_id_or_vsix "$display" "$install_path" "$launcher" "$exe" "$profile" "$REMOTE_DEVELOPMENT_EXT_ID" || return 1
+
+    ext=$(latest_remote_wsl_extension "$profile" "$data" "$product")
+    if [ -n "$ext" ]; then
+        say "Remote WSL extension installed for $display."
+        return 0
+    fi
+
+    say "Extension pack did not make Remote WSL visible; installing Remote - WSL directly..."
+    while IFS= read -r remote_ext_id; do
+        [ -n "$remote_ext_id" ] || continue
+        install_extension_id_or_vsix "$display" "$install_path" "$launcher" "$exe" "$profile" "$remote_ext_id" || continue
+
+        ext=$(latest_remote_wsl_extension "$profile" "$data" "$product")
+        if [ -n "$ext" ]; then
+            say "Remote WSL extension installed for $display."
+            return 0
+        fi
+    done < <(remote_wsl_extension_ids "$product")
+
+    say "Error: Remote WSL extension still not found under $profile/$data/extensions." >&2
+    return 1
+}
+
+generate_editor_records() {
+    local id
+    local display
+    local app_default
+    local real_app
+    local exe_default
+    local data_default
+    local server_default
+    local aliases
+    local product
+    local app
+    local exe
+    local data
+    local server
+    local name_short
+    local install_path
+    local launcher
+    local installed
+    local profile
+    local ext
+    local ext_base
+    local matched_ext_id
+    local candidate_ext_id
+    local commit
+    local server_commit
+    local server_cli_status
+    local compat_commit
+    local remote_dir
+    local wrapper
+    local helper
+    local record_line
+    local installed_out=()
+    local missing_out=()
+
+    build_product_cache
+    build_registry_cache
+
+    while IFS='|' read -r id display app_default exe_default data_default server_default aliases; do
+        app="$app_default"
+        real_app="$app_default"
+        exe="$exe_default"
+        data="$data_default"
+        server="$server_default"
+        product=""
+        install_path=""
+        launcher=""
+        installed="no"
+        ext="no"
+        matched_ext_id=""
+        commit=""
+        server_commit=""
+        server_cli_status="no"
+
+        product=$(discover_product "$id" "$app_default" "$display" "$aliases" || true)
+        if [ -n "$product" ]; then
+            real_app=$(json_get applicationName "$product")
+            [ -z "$real_app" ] && real_app="$app_default"
+            app=$(wsl_command_for_product "$id" "$app_default" "$real_app")
+            name_short=$(json_get nameShort "$product")
+            [ -n "$name_short" ] && [ "$id" != "devin" ] && display="$name_short"
+            data=$(json_get dataFolderName "$product")
+            [ -z "$data" ] && data="$data_default"
+            server=$(json_get serverDataFolderName "$product")
+            [ -z "$server" ] && server="$server_default"
+            exe=$(json_get win32DirName "$product")
+            [ -z "$exe" ] && exe="$exe_default"
+
+            install_path=$(install_path_for_product "$product" "$real_app")
+            if [ -n "$install_path" ]; then
+                launcher="$install_path/bin/$real_app"
+                [ -e "$launcher" ] && installed="yes"
+            fi
+        fi
+
+        profile=$(windows_profile_for "$install_path" "$data")
+        if [ -n "$profile" ]; then
+            ext=$(latest_remote_wsl_extension "$profile" "$data" "$product")
+            if [ -n "$ext" ]; then
+                ext_base=$(basename "$ext")
+                while IFS= read -r candidate_ext_id; do
+                    case "$ext_base" in
+                        "$candidate_ext_id"*)
+                            matched_ext_id="$candidate_ext_id"
+                            break
+                            ;;
+                    esac
+                done < <(remote_wsl_extension_ids "$product")
+            else
+                ext="no"
+            fi
+        fi
+
+        if [ "$installed" = "yes" ]; then
+            commit=$(read_launcher_value COMMIT "$launcher")
+            if [ -n "$commit" ]; then
+                server_commit="$commit"
+                if [ "$matched_ext_id" = "$REMOTE_WSL_EXT_ID" ]; then
+                    case "$app" in
+                        code|qoder|qoder-cn)
+                            ;;
+                        *)
+                            compat_commit=$(vscode_compat_commit)
+                            [ -n "$compat_commit" ] && server_commit="$compat_commit"
+                            ;;
+                    esac
+                fi
+
+                remote_dir="$HOME/$server/bin/$server_commit/bin/remote-cli"
+                if [ -x "$remote_dir/$real_app" ]; then
+                    server_cli_status="yes"
+                elif [ -x "$remote_dir/code" ]; then
+                    server_cli_status="code"
+                fi
+            fi
+        fi
+
+        wrapper=$(wrapper_state "$app")
+        helper=$(helper_state "$app")
+
+        printf -v record_line '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+            "$id" "$display" "$installed" "$app" "$exe" "$data" "$server" \
+            "$install_path" "$launcher" "$product" "$commit" "$ext" \
+            "$server_cli_status" "$wrapper" "$helper" "$aliases"
+
+        if [ "$installed" = "yes" ]; then
+            installed_out+=("$record_line")
+        else
+            missing_out+=("$record_line")
+        fi
+    done < <(candidate_defaults)
+
+    if [ "${#installed_out[@]}" -gt 0 ]; then
+        printf '%s\n' "${installed_out[@]}"
+    fi
+    if [ "${#missing_out[@]}" -gt 0 ]; then
+        printf '%s\n' "${missing_out[@]}"
+    fi
+}
+
+cache_valid() {
+    [ -f "$RECORD_CACHE" ] || return 1
+    [ -f "$VERSION_CACHE" ] || return 1
+    [ "$(cat "$VERSION_CACHE" 2>/dev/null)" = "$VERSION" ] || return 1
+}
+
+refresh_editor_cache() {
+    local tmp
+
+    mkdir -p "$CACHE_DIR"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-records.XXXXXX")
+    generate_editor_records > "$tmp"
+    mv "$tmp" "$RECORD_CACHE"
+    printf '%s\n' "$VERSION" > "$VERSION_CACHE"
+}
+
+editor_records() {
+    if [ "${WCM_CACHE_ONLY:-0}" = "1" ]; then
+        [ -f "$RECORD_CACHE" ] && cat "$RECORD_CACHE"
+        return 0
+    fi
+
+    if [ "${WCM_REFRESH:-0}" = "1" ] || ! cache_valid; then
+        refresh_editor_cache
+    fi
+
+    cat "$RECORD_CACHE"
+}
+
+record_by_id_or_app() {
+    local wanted="$1"
+    local record
+    local id
+    local app
+    local aliases
+    local alias
+    local alias_parts
+    local wanted_norm
+    local alias_norm
+
+    wanted_norm=$(normalize_words "$wanted")
+
+    while IFS= read -r record; do
+        id=$(printf '%s\n' "$record" | cut -d'|' -f1)
+        app=$(printf '%s\n' "$record" | cut -d'|' -f4)
+        if [ "$wanted" = "$id" ] || [ "$wanted" = "$app" ]; then
+            printf '%s\n' "$record"
+            return 0
+        fi
+
+        aliases=$(printf '%s\n' "$record" | cut -d'|' -f16)
+        IFS=';' read -r -a alias_parts <<< "$aliases"
+        for alias in "${alias_parts[@]}"; do
+            alias_norm=$(normalize_words "$alias")
+            if [ -n "$wanted_norm" ] && [ "$wanted_norm" = "$alias_norm" ]; then
+                printf '%s\n' "$record"
+                return 0
+            fi
+        done
+    done < <(editor_records)
+}
+
+status_word() {
+    local value="$1"
+    case "$value" in
+        yes) printf 'yes' ;;
+        no|"") printf 'no' ;;
+        *) printf '%s' "$value" ;;
+    esac
+}
+
+format_table() {
+    local color="${1:-auto}"
+    local reset=""
+    local bold=""
+    local dim=""
+    local red=""
+    local green=""
+    local yellow=""
+    local blue=""
+    local cyan=""
+    local magenta=""
+    local record
+    local id
+    local display
+    local installed
+    local app
+    local exe
+    local data
+    local server
+    local install_path
+    local launcher
+    local product
+    local commit
+    local ext
+    local server_cli
+    local wrapper
+    local helper
+    local aliases
+    local ext_status
+    local ext_color
+    local server_color
+    local wrapper_color
+    local helper_color
+
+    if [ "$color" != "never" ] && ansi_enabled; then
+        reset=$(printf '\033[0m')
+        bold=$(printf '\033[1m')
+        dim=$(printf '\033[2m')
+        red=$(printf '\033[31m')
+        green=$(printf '\033[32m')
+        yellow=$(printf '\033[33m')
+        blue=$(printf '\033[34m')
+        magenta=$(printf '\033[35m')
+        cyan=$(printf '\033[36m')
+    fi
+
+    printf '%b%-18s %-8s %-10s %-10s %-14s %-10s %s%b\n' \
+        "$bold$cyan" "Editor" "Windows" "WSL ext" "Server" "Wrapper" "Helper" "Command" "$reset"
+    printf '%b%-18s %-8s %-10s %-10s %-14s %-10s %s%b\n' \
+        "$dim" "------" "-------" "-------" "------" "-------" "------" "-------" "$reset"
+
+    while IFS='|' read -r id display installed app exe data server install_path launcher product commit ext server_cli wrapper helper aliases; do
+        if [ "$ext" = "no" ] || [ -z "$ext" ]; then
+            ext_status="no"
+        else
+            ext_status="yes"
+        fi
+
+        if [ "$installed" != "yes" ]; then
+            printf '%b%-18s %-8s %-10s %-10s %-14s %-10s %s%b %b[not installed]%b\n' \
+                "$dim" "$display" "$(status_word "$installed")" "$ext_status" \
+                "$server_cli" "$wrapper" "$helper" "$app" "$reset" "$dim" "$reset"
+        else
+            case "$ext_status" in
+                yes) ext_color="$green" ;;
+                *) ext_color="$yellow" ;;
+            esac
+            case "$server_cli" in
+                yes) server_color="$green" ;;
+                code) server_color="$yellow" ;;
+                *) server_color="$yellow" ;;
+            esac
+            case "$wrapper" in
+                installed*) wrapper_color="$green" ;;
+                custom*) wrapper_color="$yellow" ;;
+                *) wrapper_color="$red" ;;
+            esac
+            case "$helper" in
+                installed*) helper_color="$green" ;;
+                custom*) helper_color="$yellow" ;;
+                *) helper_color="$dim" ;;
+            esac
+
+            printf '%b%-18s%b ' "$cyan" "$display" "$reset"
+            printf '%b%-8s%b ' "$green" "$(status_word "$installed")" "$reset"
+            printf '%b%-10s%b ' "$ext_color" "$ext_status" "$reset"
+            printf '%b%-10s%b ' "$server_color" "$server_cli" "$reset"
+            printf '%b%-14s%b ' "$wrapper_color" "$wrapper" "$reset"
+            printf '%b%-10s%b ' "$helper_color" "$helper" "$reset"
+            printf '%b%s%b\n' "$blue" "$app" "$reset"
+        fi
+    done < <(editor_records)
+}
+
+ansi_enabled() {
+    [ "${WCM_COLOR:-auto}" = "always" ] && return 0
+    [ -z "${NO_COLOR:-}" ] || return 1
+    [ -t 1 ]
+}
+
+ansi() {
+    ansi_enabled && printf '\033[%sm' "$1"
+}
+
+clear_screen() {
+    if [ -t 1 ]; then
+        printf '\033[H\033[2J'
+    fi
+}
+
+splash() {
+    local bold
+    local cyan
+    local dim
+    local reset
+
+    bold=$(ansi '1')
+    cyan=$(ansi '36')
+    dim=$(ansi '2')
+    reset=$(ansi '0')
+
+    cat <<EOF
+${cyan}${bold}__        ______ __  __
+\ \      / / ___|  \/  |
+ \ \ /\ / / |   | |\/| |
+  \ V  V /| |___| |  | |
+   \_/\_/  \____|_|  |_|${reset}
+${bold}WSL Code Manager v$VERSION${reset}
+${dim}Manage WSL launchers for VS Code based editors${reset}
+EOF
+}
+
+pause_plain() {
+    printf '\nPress Enter to continue... '
+    IFS= read -r _
+}
+
+show_text() {
+    local title="$1"
+    local text="$2"
+    local bold
+    local reset
+
+    bold=$(ansi '1')
+    reset=$(ansi '0')
+
+    clear_screen
+    splash
+    printf '\n%s%s%s\n\n%s\n' "$bold" "$title" "$reset" "$text"
+    pause_plain
+}
+
+refresh_with_spinner() {
+    local tmp
+    local pid
+    local frame
+    local i=0
+    local status
+    local dim
+    local reset
+
+    dim=$(ansi '2')
+    reset=$(ansi '0')
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-refresh.XXXXXX")
+
+    (refresh_editor_cache > "$tmp" 2>&1) &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        case $((i % 4)) in
+            0) frame='|' ;;
+            1) frame='/' ;;
+            2) frame='-' ;;
+            *) frame='\' ;;
+        esac
+        printf '\r%bRefreshing local status %s%b' "$dim" "$frame" "$reset"
+        i=$((i + 1))
+        sleep 0.12
+    done
+
+    wait "$pid"
+    status=$?
+
+    if [ "$status" -eq 0 ]; then
+        printf '\r%bRefreshing local status done%b\n' "$dim" "$reset"
+    else
+        printf '\r%bRefreshing local status failed%b\n' "$dim" "$reset"
+    fi
+
+    if [ -s "$tmp" ]; then
+        cat "$tmp"
+    fi
+
+    rm -f "$tmp"
+    return "$status"
+}
+
+terminal_view_list() {
+    clear_screen
+    splash
+    printf '\n%s\n\n' "Editor list (cached)"
+    WCM_CACHE_ONLY=1 WCM_COLOR=always format_table auto
+    printf '\n'
+
+    if ! refresh_with_spinner; then
+        pause_plain
+        return 0
+    fi
+
+    show_text "Editor list (refreshed)" "$(WCM_COLOR=always format_table auto)"
+}
+
+confirm_action() {
+    local message="$1"
+    local answer
+
+    printf '%s [y/N] ' "$message"
+    IFS= read -r answer
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+shell_write_assignment() {
+    local key="$1"
+    local value="$2"
+    printf '%s=%q\n' "$key" "$value"
+}
+
+vscode_compat_commit() {
+    local product
+    local install_path
+    local launcher
+    local commit
+
+    product=$(discover_product "vscode" "code" "VS Code" "Microsoft VS Code;Visual Studio Code;VSCode" || true)
+    [ -n "$product" ] || return 0
+
+    install_path=$(install_path_for_product "$product" "code")
+    [ -n "$install_path" ] || return 0
+
+    launcher="$install_path/bin/code"
+    commit=$(read_launcher_value COMMIT "$launcher")
+    [ -n "$commit" ] && printf '%s\n' "$commit"
+}
+
+server_commit_for_wrapper() {
+    local app="$1"
+    local commit="$2"
+    local remote_ext_ids="$3"
+    local primary_remote_ext_id
+    local compat_commit
+
+    primary_remote_ext_id="${remote_ext_ids%% *}"
+    if [ "$primary_remote_ext_id" = "$REMOTE_WSL_EXT_ID" ]; then
+        case "$app" in
+            code|qoder|qoder-cn)
+                ;;
+            *)
+                compat_commit=$(vscode_compat_commit)
+                [ -n "$compat_commit" ] && printf '%s\n' "$compat_commit" && return 0
+                ;;
+        esac
+    fi
+
+    printf '%s\n' "$commit"
+}
+
+write_helper() {
+    local helper_path="$1"
+    local display="$2"
+    local tmp
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-helper.XXXXXX")
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf '# %s helper for %s\n' "$MARKER" "$display"
+        printf '%s\n' ''
+        printf '%s\n' 'set -e'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$WCM_EDITOR_ELECTRON" ] || [ -z "$WCM_EDITOR_VSCODE_PATH" ]; then'
+        printf '%s\n' '    echo "Error: WCM editor launch environment is missing." >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ "${1:-}" ]; then'
+        printf '%s\n' '    case "$1" in'
+        printf '%s\n' '        resources/app/out/cli.js|*/resources/app/out/cli.js)'
+        printf '%s\n' '            WCM_CLI="$1"'
+        printf '%s\n' '            shift'
+        printf '%s\n' '            case "$WCM_CLI" in'
+        printf '%s\n' '                /mnt/*)'
+        printf '%s\n' '                    ;;'
+        printf '%s\n' '                *)'
+        printf '%s\n' '                    if [ -f "$WCM_EDITOR_VSCODE_PATH/$WCM_CLI" ]; then'
+        printf '%s\n' '                        WCM_CLI="$WCM_EDITOR_VSCODE_PATH/$WCM_CLI"'
+        printf '%s\n' '                    elif [ -n "${WCM_EDITOR_VERSIONFOLDER:-}" ] && [ -f "$WCM_EDITOR_VSCODE_PATH/$WCM_EDITOR_VERSIONFOLDER/resources/app/out/cli.js" ]; then'
+        printf '%s\n' '                        WCM_CLI="$WCM_EDITOR_VSCODE_PATH/$WCM_EDITOR_VERSIONFOLDER/resources/app/out/cli.js"'
+        printf '%s\n' '                    else'
+        printf '%s\n' '                        WCM_CLI="$WCM_EDITOR_VSCODE_PATH/resources/app/out/cli.js"'
+        printf '%s\n' '                    fi'
+        printf '%s\n' '                    ;;'
+        printf '%s\n' '            esac'
+        printf '%s\n' '            if command -v wslpath >/dev/null 2>&1; then'
+        printf '%s\n' '                WCM_CLI=$(wslpath -m "$WCM_CLI")'
+        printf '%s\n' '            fi'
+        printf '%s\n' '            set -- "$WCM_CLI" "$@"'
+        printf '%s\n' '            ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -x /init ]; then'
+        printf '%s\n' '    exec /init "$WCM_EDITOR_ELECTRON" -- "$@"'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'exec "$WCM_EDITOR_ELECTRON" "$@"'
+    } > "$tmp"
+
+    chmod +x "$tmp"
+    mv "$tmp" "$helper_path"
+}
+
+write_wrapper() {
+    local wrapper_path="$1"
+    local display="$2"
+    local app="$3"
+    local exe="$4"
+    local data="$5"
+    local server="$6"
+    local launcher="$7"
+    local install_path="$8"
+    local commit="$9"
+    local product="${10:-}"
+    local aliases="${11:-}"
+    local real_app
+    local remote_ext_ids
+    local default_server_commit
+    local tmp
+
+    real_app=$(basename "$launcher")
+    [ -z "$real_app" ] && real_app="$app"
+    remote_ext_ids=$(remote_wsl_extension_id_words "$product")
+    default_server_commit=$(server_commit_for_wrapper "$app" "$commit" "$remote_ext_ids")
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-wrapper.XXXXXX")
+    {
+        printf '%s\n' '#!/bin/bash'
+        printf '# %s wrapper for %s\n' "$MARKER" "$display"
+        printf '%s\n' ''
+        printf '%s\n' 'set -e'
+        printf '%s\n' ''
+        shell_write_assignment WCM_APP_NAME "$app"
+        shell_write_assignment WCM_REAL_APP_NAME "$real_app"
+        shell_write_assignment WCM_DISPLAY_NAME "$display"
+        shell_write_assignment WCM_EXE_NAME "$exe"
+        shell_write_assignment WCM_DATA_FOLDER "$data"
+        shell_write_assignment WCM_SERVER_DATA_FOLDER "$server"
+        shell_write_assignment WCM_REAL_LAUNCHER "$launcher"
+        shell_write_assignment WCM_INSTALL_PATH "$install_path"
+        shell_write_assignment WCM_DEFAULT_COMMIT "$commit"
+        shell_write_assignment WCM_DEFAULT_SERVER_COMMIT "$default_server_commit"
+        shell_write_assignment WCM_CLIENT_COMMAND "$INSTALL_DIR/$app-wsl-client"
+        shell_write_assignment WCM_REMOTE_WSL_EXT_IDS "$remote_ext_ids"
+        shell_write_assignment WCM_REGISTRY_ALIASES "$aliases"
+        printf '%s\n' ''
+        printf '%s\n' 'read_launcher_value() {'
+        printf '%s\n' '    local key="$1"'
+        printf '%s\n' '    local file="$2"'
+        printf '%s\n' '    [ -f "$file" ] || return 0'
+        printf '%s\n' '    grep "^${key}=" "$file" 2>/dev/null | head -n 1 | cut -d\" -f2'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'default_windows_profile() {'
+        printf '%s\n' '    local d'
+        printf '%s\n' '    for d in /mnt/c/Users/*; do'
+        printf '%s\n' '        [ -d "$d" ] || continue'
+        printf '%s\n' '        case "$(basename "$d")" in'
+        printf '%s\n' '            Public|Default|Default\ User|All\ Users) continue ;;'
+        printf '%s\n' '        esac'
+        printf '%s\n' '        printf "%s\n" "$d"'
+        printf '%s\n' '        return 0'
+        printf '%s\n' '    done'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'normalize_words() {'
+        printf '%s\n' '    local value="${1,,}"'
+        printf '%s\n' '    local words'
+        printf '%s\n' '    value=${value//[![:alnum:]]/ }'
+        printf '%s\n' '    read -r -a words <<< "$value"'
+        printf '%s\n' '    printf "%s\n" "${words[*]}"'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'phrase_in_words() {'
+        printf '%s\n' '    local hay'
+        printf '%s\n' '    local needle'
+        printf '%s\n' '    hay=$(normalize_words "$1")'
+        printf '%s\n' '    needle=$(normalize_words "$2")'
+        printf '%s\n' '    [ -n "$needle" ] || return 1'
+        printf '%s\n' '    case " $hay " in'
+        printf '%s\n' '        *" $needle "*) return 0 ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' '    return 1'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'windows_reg_query() {'
+        printf '%s\n' '    local key="$1"'
+        printf '%s\n' '    if [ -x /init ] && [ -x /mnt/c/Windows/System32/reg.exe ]; then'
+        printf '%s\n' '        /init /mnt/c/Windows/System32/reg.exe -- query "$key" /s 2>/dev/null </dev/null'
+        printf '%s\n' '        return $?'
+        printf '%s\n' '    fi'
+        printf '%s\n' '    if command -v reg.exe >/dev/null 2>&1; then'
+        printf '%s\n' '        reg.exe query "$key" /s 2>/dev/null </dev/null'
+        printf '%s\n' '    fi'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'clean_windows_path_value() {'
+        printf '%s\n' '    local value="$1"'
+        printf '%s\n' '    value=${value//$'"'"'\r'"'"'/}'
+        printf '%s\n' '    value=${value%%,0}'
+        printf '%s\n' '    value=${value#\"}'
+        printf '%s\n' '    value=${value%%\"*}'
+        printf '%s\n' '    value=${value%\\}'
+        printf '%s\n' '    printf "%s\n" "$value"'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'windows_path_to_wsl() {'
+        printf '%s\n' '    local win_path="$1"'
+        printf '%s\n' '    local drive'
+        printf '%s\n' '    local rest'
+        printf '%s\n' '    [ -n "$win_path" ] || return 0'
+        printf '%s\n' '    if command -v wslpath >/dev/null 2>&1; then'
+        printf '%s\n' '        wslpath -u "$win_path" 2>/dev/null && return 0'
+        printf '%s\n' '    fi'
+        printf '%s\n' '    case "$win_path" in'
+        printf '%s\n' '        [A-Za-z]:\\*)'
+        printf '%s\n' '            drive="${win_path%%:*}"'
+        printf '%s\n' '            drive="${drive,,}"'
+        printf '%s\n' '            rest=${win_path#?:\\}'
+        printf '%s\n' '            rest=${rest//\\//}'
+        printf '%s\n' '            printf "/mnt/%s/%s\n" "$drive" "$rest"'
+        printf '%s\n' '            ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'candidate_launcher_under_base() {'
+        printf '%s\n' '    local base="$1"'
+        printf '%s\n' '    local target'
+        printf '%s\n' '    for target in "$base/bin/$WCM_REAL_APP_NAME" "$base/resources/app/bin/$WCM_REAL_APP_NAME" "$base"/*/resources/app/bin/"$WCM_REAL_APP_NAME"; do'
+        printf '%s\n' '        [ -x "$target" ] && [ -f "$target" ] && printf "%s\n" "$target" && return 0'
+        printf '%s\n' '    done'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'registry_display_matches() {'
+        printf '%s\n' '    local hay="$1"'
+        printf '%s\n' '    local alias'
+        printf '%s\n' '    IFS=";" read -ra WCM_ALIAS_PARTS <<< "${WCM_REGISTRY_ALIASES};${WCM_DISPLAY_NAME};${WCM_APP_NAME};${WCM_REAL_APP_NAME}"'
+        printf '%s\n' '    for alias in "${WCM_ALIAS_PARTS[@]}"; do'
+        printf '%s\n' '        [ -n "$alias" ] || continue'
+        printf '%s\n' '        phrase_in_words "$hay" "$alias" && return 0'
+        printf '%s\n' '    done'
+        printf '%s\n' '    return 1'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'locate_launcher_from_registry() {'
+        printf '%s\n' '    local root'
+        printf '%s\n' '    local line'
+        printf '%s\n' '    local display=""'
+        printf '%s\n' '    local install=""'
+        printf '%s\n' '    local app_path=""'
+        printf '%s\n' '    local icon=""'
+        printf '%s\n' '    local name'
+        printf '%s\n' '    local value'
+        printf '%s\n' '    local base_win'
+        printf '%s\n' '    local base_wsl'
+        printf '%s\n' '    local launcher'
+        printf '%s\n' ''
+        printf '%s\n' '    flush_entry() {'
+        printf '%s\n' '        local hay="$display $install $app_path $icon"'
+        printf '%s\n' '        registry_display_matches "$hay" || return 0'
+        printf '%s\n' '        base_win=$(clean_windows_path_value "${install:-$app_path}")'
+        printf '%s\n' '        if [ -z "$base_win" ]; then'
+        printf '%s\n' '            base_win=$(clean_windows_path_value "$icon")'
+        printf '%s\n' '            case "$base_win" in *.exe|*.EXE) base_win=${base_win%\\*} ;; esac'
+        printf '%s\n' '        fi'
+        printf '%s\n' '        base_wsl=$(windows_path_to_wsl "$base_win")'
+        printf '%s\n' '        [ -n "$base_wsl" ] && [ -d "$base_wsl" ] || return 0'
+        printf '%s\n' '        launcher=$(candidate_launcher_under_base "$base_wsl")'
+        printf '%s\n' '        [ -n "$launcher" ] && printf "%s\n" "$launcher" && return 2'
+        printf '%s\n' '        return 0'
+        printf '%s\n' '    }'
+        printf '%s\n' ''
+        printf '%s\n' '    for root in \'
+        printf '%s\n' '        "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall" \'
+        printf '%s\n' '        "HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall" \'
+        printf '%s\n' '        "HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"'
+        printf '%s\n' '    do'
+        printf '%s\n' '        while IFS= read -r line; do'
+        printf '%s\n' '            line=${line//$'"'"'\r'"'"'/}'
+        printf '%s\n' '            case "$line" in'
+        printf '%s\n' '                HKEY*)'
+        printf '%s\n' '                    if flush_entry; then :; else [ "$?" -eq 2 ] && return 0; fi'
+        printf '%s\n' '                    display=""'
+        printf '%s\n' '                    install=""'
+        printf '%s\n' '                    app_path=""'
+        printf '%s\n' '                    icon=""'
+        printf '%s\n' '                    ;;'
+        printf '%s\n' '                *"    REG_SZ    "*)'
+        printf '%s\n' '                    name=${line%%    REG_SZ    *}'
+        printf '%s\n' '                    value=${line#*    REG_SZ    }'
+        printf '%s\n' '                    name=${name#"${name%%[![:space:]]*}"}'
+        printf '%s\n' '                    name=${name%"${name##*[![:space:]]}"}'
+        printf '%s\n' '                    case "$name" in'
+        printf '%s\n' '                        DisplayName) display="$value" ;;'
+        printf '%s\n' '                        InstallLocation) install="$value" ;;'
+        printf '%s\n' '                        "Inno Setup: App Path") app_path="$value" ;;'
+        printf '%s\n' '                        DisplayIcon) icon="$value" ;;'
+        printf '%s\n' '                    esac'
+        printf '%s\n' '                    ;;'
+        printf '%s\n' '            esac'
+        printf '%s\n' '        done < <(windows_reg_query "$root")'
+        printf '%s\n' '        if flush_entry; then :; else [ "$?" -eq 2 ] && return 0; fi'
+        printf '%s\n' '    done'
+        printf '%s\n' '}'
+        printf '%s\n' ''
+        printf '%s\n' 'MY_PATH=$(realpath "$0")'
+        printf '%s\n' 'REAL_EDITOR_PATH=""'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -x "$WCM_REAL_LAUNCHER" ]; then'
+        printf '%s\n' '    REAL_EDITOR_PATH="$WCM_REAL_LAUNCHER"'
+        printf '%s\n' 'else'
+        printf '%s\n' '    IFS=":" read -ra PATH_DIRS <<< "$PATH"'
+        printf '%s\n' '    for dir in "${PATH_DIRS[@]}"; do'
+        printf '%s\n' '        [ -z "$dir" ] && continue'
+        printf '%s\n' '        target="$dir/$WCM_REAL_APP_NAME"'
+        printf '%s\n' '        if [ -x "$target" ] && [ -f "$target" ]; then'
+        printf '%s\n' '            target_real=$(realpath "$target")'
+        printf '%s\n' '            case "$target_real" in'
+        printf '%s\n' '                /mnt/*)'
+        printf '%s\n' '                    if [ "$target_real" != "$MY_PATH" ]; then'
+        printf '%s\n' '                        REAL_EDITOR_PATH="$target"'
+        printf '%s\n' '                        break'
+        printf '%s\n' '                    fi'
+        printf '%s\n' '                    ;;'
+        printf '%s\n' '            esac'
+        printf '%s\n' '        fi'
+        printf '%s\n' '    done'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$REAL_EDITOR_PATH" ]; then'
+        printf '%s\n' '    REAL_EDITOR_PATH=$(locate_launcher_from_registry || true)'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$REAL_EDITOR_PATH" ]; then'
+        printf '%s\n' '    echo "Error: Could not find the real $WCM_DISPLAY_NAME launcher." >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'CURRENT_COMMIT=$(read_launcher_value COMMIT "$REAL_EDITOR_PATH")'
+        printf '%s\n' 'APP_NAME=$(read_launcher_value APP_NAME "$REAL_EDITOR_PATH")'
+        printf '%s\n' 'QUALITY=$(read_launcher_value QUALITY "$REAL_EDITOR_PATH")'
+        printf '%s\n' 'NAME=$(read_launcher_value NAME "$REAL_EDITOR_PATH")'
+        printf '%s\n' 'SERVERDATAFOLDER=$(read_launcher_value SERVERDATAFOLDER "$REAL_EDITOR_PATH")'
+        printf '%s\n' 'VERSIONFOLDER=$(read_launcher_value VERSIONFOLDER "$REAL_EDITOR_PATH")'
+        printf '%s\n' ''
+        printf '%s\n' '[ -z "$CURRENT_COMMIT" ] && CURRENT_COMMIT="$WCM_DEFAULT_COMMIT"'
+        printf '%s\n' '[ -z "$APP_NAME" ] && APP_NAME="$WCM_REAL_APP_NAME"'
+        printf '%s\n' '[ -z "$QUALITY" ] && QUALITY="stable"'
+        printf '%s\n' '[ -z "$NAME" ] && NAME="$WCM_EXE_NAME"'
+        printf '%s\n' '[ -z "$SERVERDATAFOLDER" ] && SERVERDATAFOLDER="$WCM_SERVER_DATA_FOLDER"'
+        printf '%s\n' 'SERVER_COMMIT="$CURRENT_COMMIT"'
+        printf '%s\n' ''
+        printf '%s\n' 'VSCODE_PATH=""'
+        printf '%s\n' 'WCM_SEARCH_DIR=$(dirname "$(realpath "$REAL_EDITOR_PATH")")'
+        printf '%s\n' 'while [ "$WCM_SEARCH_DIR" != "/" ] && [ -n "$WCM_SEARCH_DIR" ]; do'
+        printf '%s\n' '    if [ -f "$WCM_SEARCH_DIR/$NAME.exe" ]; then'
+        printf '%s\n' '        VSCODE_PATH="$WCM_SEARCH_DIR"'
+        printf '%s\n' '        break'
+        printf '%s\n' '    fi'
+        printf '%s\n' '    WCM_SEARCH_DIR=$(dirname "$WCM_SEARCH_DIR")'
+        printf '%s\n' 'done'
+        printf '%s\n' 'if [ -z "$VSCODE_PATH" ]; then'
+        printf '%s\n' '    VSCODE_PATH="$(dirname "$(dirname "$(realpath "$REAL_EDITOR_PATH")")")"'
+        printf '%s\n' 'fi'
+        printf '%s\n' 'ELECTRON="$VSCODE_PATH/$NAME.exe"'
+        printf '%s\n' ''
+        printf '%s\n' 'IN_WSL=false'
+        printf '%s\n' 'if [ -n "$WSL_DISTRO_NAME" ]; then'
+        printf '%s\n' '    IN_WSL=true'
+        printf '%s\n' 'else'
+        printf '%s\n' '    UNAME_RELEASE=$(uname -r)'
+        printf '%s\n' '    case "$UNAME_RELEASE" in'
+        printf '%s\n' '        *Microsoft*|*microsoft*|*WSL*) IN_WSL=true ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ "$IN_WSL" != true ] && [ -d /mnt/c/Windows ]; then'
+        printf '%s\n' '    case "$REAL_EDITOR_PATH" in /mnt/*) IN_WSL=true ;; esac'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ "$IN_WSL" != true ]; then'
+        printf '%s\n' '    "$REAL_EDITOR_PATH" "$@"'
+        printf '%s\n' '    exit $?'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'WSL_USER_PROFILE=""'
+        printf '%s\n' 'if WIN_PROFILE_FROM_CMD=$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '"'"'\r'"'"'); then'
+        printf '%s\n' '    [ -n "$WIN_PROFILE_FROM_CMD" ] && WSL_USER_PROFILE=$(wslpath -u "$WIN_PROFILE_FROM_CMD" 2>/dev/null || true)'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$WSL_USER_PROFILE" ]; then'
+        printf '%s\n' '    case "$VSCODE_PATH" in'
+        printf '%s\n' '        /mnt/*/Users/*/*) WSL_USER_PROFILE=$(printf "%s\n" "$VSCODE_PATH" | sed -E '"'"'s#^(/mnt/[^/]+/Users/[^/]+)/.*#\1#'"'"') ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$WSL_USER_PROFILE" ]; then'
+        printf '%s\n' '    for d in /mnt/c/Users/*; do'
+        printf '%s\n' '        [ -d "$d/$WCM_DATA_FOLDER" ] && WSL_USER_PROFILE="$d" && break'
+        printf '%s\n' '    done'
+        printf '%s\n' 'fi'
+        printf '%s\n' '[ -z "$WSL_USER_PROFILE" ] && WSL_USER_PROFILE=$(default_windows_profile)'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ -z "$WSL_USER_PROFILE" ] || [ ! -d "$WSL_USER_PROFILE" ]; then'
+        printf '%s\n' '    echo "Error: Could not determine Windows user profile in WSL." >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'EDITOR_EXT_DIR="$WSL_USER_PROFILE/$WCM_DATA_FOLDER/extensions"'
+        printf '%s\n' 'WSL_EXT_WLOC=""'
+        printf '%s\n' 'for WCM_REMOTE_WSL_EXT_ID in $WCM_REMOTE_WSL_EXT_IDS; do'
+        printf '%s\n' '    WSL_EXT_WLOC=$(find "$EDITOR_EXT_DIR" -maxdepth 1 -type d -name "$WCM_REMOTE_WSL_EXT_ID*" 2>/dev/null | sort -V | tail -n 1)'
+        printf '%s\n' '    [ -n "$WSL_EXT_WLOC" ] && break'
+        printf '%s\n' 'done'
+        printf '%s\n' 'if [ -z "$WSL_EXT_WLOC" ]; then'
+        printf '%s\n' '    echo "Error: Could not find $WCM_DISPLAY_NAME Remote WSL extension." >&2'
+        printf '%s\n' '    echo "Expected extension ids under $EDITOR_EXT_DIR: $WCM_REMOTE_WSL_EXT_IDS" >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ "$WCM_REMOTE_WSL_EXT_ID" = "ms-vscode-remote.remote-wsl" ]; then'
+        printf '%s\n' '    case "$APP_NAME" in'
+        printf '%s\n' '        code|qoder|qoder-cn) ;;'
+        printf '%s\n' '        *) [ -n "$WCM_DEFAULT_SERVER_COMMIT" ] && SERVER_COMMIT="$WCM_DEFAULT_SERVER_COMMIT" ;;'
+        printf '%s\n' '    esac'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'WSL_CODE=""'
+        printf '%s\n' 'for WCM_WSL_SCRIPT in "$WSL_EXT_WLOC/scripts/wslCode.sh" "$WSL_EXT_WLOC/dist/scripts/wslCode.sh" "$WSL_EXT_WLOC/dist/scripts/wslCursor.sh"; do'
+        printf '%s\n' '    [ -f "$WCM_WSL_SCRIPT" ] && WSL_CODE="$WCM_WSL_SCRIPT" && break'
+        printf '%s\n' 'done'
+        printf '%s\n' 'if [ ! -f "$WSL_CODE" ]; then'
+        printf '%s\n' '    echo "Error: Remote WSL extension is missing a supported WSL launch script." >&2'
+        printf '%s\n' '    echo "Extension path: $WSL_EXT_WLOC" >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ "$SERVER_COMMIT" != "$CURRENT_COMMIT" ]; then'
+        printf '%s\n' '    WCM_VSCODE_SERVER_SOURCE="$HOME/.vscode-server/bin/$SERVER_COMMIT"'
+        printf '%s\n' '    WCM_EDITOR_SERVER_TARGET="$HOME/$SERVERDATAFOLDER/bin/$SERVER_COMMIT"'
+        printf '%s\n' '    if [ ! -e "$WCM_EDITOR_SERVER_TARGET" ] && [ -d "$WCM_VSCODE_SERVER_SOURCE" ]; then'
+        printf '%s\n' '        mkdir -p "$(dirname "$WCM_EDITOR_SERVER_TARGET")"'
+        printf '%s\n' '        ln -s "$WCM_VSCODE_SERVER_SOURCE" "$WCM_EDITOR_SERVER_TARGET" 2>/dev/null || true'
+        printf '%s\n' '    fi'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'REMOTE_CLI_DIR="$HOME/$SERVERDATAFOLDER/bin/$SERVER_COMMIT/bin/remote-cli"'
+        printf '%s\n' 'REMOTE_CLI="$REMOTE_CLI_DIR/$APP_NAME"'
+        printf '%s\n' 'ensure_remote_cli_link() {'
+        printf '%s\n' '    if [ ! -x "$REMOTE_CLI" ] && [ -x "$REMOTE_CLI_DIR/code" ]; then'
+        printf '%s\n' '        ln -sf code "$REMOTE_CLI" 2>/dev/null || true'
+        printf '%s\n' '    fi'
+        printf '%s\n' '}'
+        printf '%s\n' 'ensure_remote_cli_link'
+        printf '%s\n' 'if [ ! -x "$REMOTE_CLI" ]; then'
+        printf '%s\n' '    ('
+        printf '%s\n' '        WCM_LINK_WATCH_COUNT=0'
+        printf '%s\n' '        while [ "$WCM_LINK_WATCH_COUNT" -lt 3600 ]; do'
+        printf '%s\n' '            ensure_remote_cli_link'
+        printf '%s\n' '            [ -x "$REMOTE_CLI" ] && exit 0'
+        printf '%s\n' '            WCM_LINK_WATCH_COUNT=$((WCM_LINK_WATCH_COUNT + 1))'
+        printf '%s\n' '            sleep 0.2'
+        printf '%s\n' '        done'
+        printf '%s\n' '    ) >/dev/null 2>&1 &'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'if [ ! -x "$WCM_CLIENT_COMMAND" ]; then'
+        printf '%s\n' '    echo "Error: WCM client helper is missing or not executable." >&2'
+        printf '%s\n' '    echo "Expected: $WCM_CLIENT_COMMAND" >&2'
+        printf '%s\n' '    exit 1'
+        printf '%s\n' 'fi'
+        printf '%s\n' ''
+        printf '%s\n' 'export WSLENV="ELECTRON_RUN_AS_NODE/w:$WSLENV"'
+        printf '%s\n' 'export WCM_EDITOR_ELECTRON="$ELECTRON"'
+        printf '%s\n' 'export WCM_EDITOR_VSCODE_PATH="$VSCODE_PATH"'
+        printf '%s\n' 'export WCM_EDITOR_VERSIONFOLDER="$VERSIONFOLDER"'
+        printf '%s\n' ''
+        printf '%s\n' '"$WSL_CODE" "$SERVER_COMMIT" "$QUALITY" "$WCM_CLIENT_COMMAND" "$APP_NAME" "$SERVERDATAFOLDER" "$@"'
+        printf '%s\n' 'exit $?'
+    } > "$tmp"
+
+    chmod +x "$tmp"
+    mv "$tmp" "$wrapper_path"
+}
+
+backup_path() {
+    local path="$1"
+    local ts
+
+    ts=$(date +%Y%m%d%H%M%S)
+    printf '%s.bak.%s\n' "$path" "$ts"
+}
+
+install_record() {
+    local record="$1"
+    local batch="${2:-no}"
+    local force="${3:-no}"
+    local id
+    local display
+    local installed
+    local app
+    local exe
+    local data
+    local server
+    local install_path
+    local launcher
+    local product
+    local commit
+    local ext
+    local server_cli
+    local wrapper_state_value
+    local helper_state_value
+    local aliases
+    local wrapper_path
+    local helper_path
+    local backup
+    local profile
+
+    IFS='|' read -r id display installed app exe data server install_path launcher product commit ext server_cli wrapper_state_value helper_state_value aliases <<< "$record"
+
+    if [ "$installed" != "yes" ]; then
+        say "Skip $display: Windows client is not installed."
+        return 0
+    fi
+
+    profile=$(windows_profile_for "$install_path" "$data")
+    if [ -z "$profile" ]; then
+        say "Skip $display: could not determine Windows user profile."
+        return 0
+    fi
+
+    if ! ensure_remote_wsl_extension "$display" "$install_path" "$launcher" "$exe" "$data" "$profile" "$product"; then
+        say "Skip $display: Remote Development / Remote WSL extension install failed."
+        return 0
+    fi
+
+    ext=$(latest_remote_wsl_extension "$profile" "$data" "$product")
+    if [ -z "$ext" ]; then
+        say "Skip $display: Remote WSL extension is not installed in $data."
+        return 0
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
+
+    if [ -e "$wrapper_path" ]; then
+        if is_wcm_file "$wrapper_path" && [ -e "$helper_path" ] && is_wcm_file "$helper_path" && [ "$force" != "yes" ]; then
+            say "Already installed: $display"
+            return 0
+        fi
+
+        if ! is_wcm_file "$wrapper_path" && [ "$batch" = "yes" ]; then
+            say "Skip $display: existing custom wrapper at $wrapper_path"
+            return 0
+        fi
+
+        if ! is_wcm_file "$wrapper_path"; then
+            if ! confirm_action "$display already has a custom wrapper. Back it up and replace it with a WCM installed wrapper?"; then
+                say "Skip $display."
+                return 0
+            fi
+
+            backup=$(backup_path "$wrapper_path")
+            mv "$wrapper_path" "$backup"
+            say "Backed up wrapper: $backup"
+        fi
+    fi
+
+    if [ -e "$helper_path" ] && ! is_wcm_file "$helper_path"; then
+        if [ "$batch" = "yes" ]; then
+            say "Skip $display: existing custom helper at $helper_path"
+            return 0
+        fi
+
+        if ! confirm_action "$display already has a custom helper. Back it up and replace it?"; then
+            say "Skip $display."
+            return 0
+        fi
+
+        backup=$(backup_path "$helper_path")
+        mv "$helper_path" "$backup"
+        say "Backed up helper: $backup"
+    fi
+
+    write_helper "$helper_path" "$display"
+    write_wrapper "$wrapper_path" "$display" "$app" "$exe" "$data" "$server" "$launcher" "$install_path" "$commit" "$product" "$aliases"
+    if [ "$force" = "yes" ]; then
+        say "Reinstalled: $display -> $wrapper_path"
+    else
+        say "Installed: $display -> $wrapper_path"
+    fi
+    refresh_editor_cache >/dev/null 2>&1 || true
+}
+
+install_one() {
+    local wanted="$1"
+    local force="${2:-no}"
+    local record
+
+    record=$(record_by_id_or_app "$wanted")
+    if [ -z "$record" ]; then
+        say "Unknown editor: $wanted"
+        return 1
+    fi
+
+    install_record "$record" "no" "$force"
+}
+
+reinstall_one() {
+    install_one "$1" "yes"
+}
+
+install_all() {
+    local record
+    local id
+    local display
+    local installed
+
+    while IFS= read -r record; do
+        IFS='|' read -r id display installed _ <<< "$record"
+        [ "$installed" = "yes" ] && install_record "$record" "yes"
+    done < <(editor_records)
+}
+
+uninstall_record() {
+    local record="$1"
+    local id
+    local display
+    local installed
+    local app
+    local wrapper_path
+    local helper_path
+    local removed="no"
+
+    IFS='|' read -r id display installed app _ <<< "$record"
+
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
+
+    if is_wcm_file "$wrapper_path"; then
+        rm -f "$wrapper_path"
+        say "Removed installed wrapper: $wrapper_path"
+        removed="yes"
+    elif [ -e "$wrapper_path" ]; then
+        say "Left custom wrapper untouched: $wrapper_path"
+    fi
+
+    if is_wcm_file "$helper_path"; then
+        rm -f "$helper_path"
+        say "Removed installed helper: $helper_path"
+        removed="yes"
+    elif [ -e "$helper_path" ]; then
+        say "Left custom helper untouched: $helper_path"
+    fi
+
+    if [ "$removed" = "yes" ]; then
+        say "Restored official launcher fallback for $display."
+    else
+        say "No WCM installed wrapper/helper to uninstall for $display."
+    fi
+
+    refresh_editor_cache >/dev/null 2>&1 || true
+}
+
+uninstall_one() {
+    local wanted="$1"
+    local record
+
+    record=$(record_by_id_or_app "$wanted")
+    if [ -z "$record" ]; then
+        say "Unknown editor: $wanted"
+        return 1
+    fi
+
+    uninstall_record "$record"
+}
+
+upgrade_record() {
+    local record="$1"
+    local id
+    local display
+    local installed
+    local app
+    local exe
+    local data
+    local server
+    local install_path
+    local launcher
+    local product
+    local commit
+    local ext
+    local server_cli
+    local wrapper_state_value
+    local helper_state_value
+    local aliases
+    local wrapper_path
+    local helper_path
+    local changed="no"
+
+    IFS='|' read -r id display installed app exe data server install_path launcher product commit ext server_cli wrapper_state_value helper_state_value aliases <<< "$record"
+
+    if [ "$installed" != "yes" ]; then
+        return 0
+    fi
+
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
+
+    if is_wcm_file "$wrapper_path"; then
+        write_wrapper "$wrapper_path" "$display" "$app" "$exe" "$data" "$server" "$launcher" "$install_path" "$commit" "$product" "$aliases"
+        say "Upgraded wrapper: $display -> $wrapper_path"
+        changed="yes"
+    elif [ -e "$wrapper_path" ]; then
+        say "Skip wrapper: $display has custom wrapper at $wrapper_path"
+    fi
+
+    if is_wcm_file "$helper_path"; then
+        write_helper "$helper_path" "$display"
+        say "Upgraded helper: $display -> $helper_path"
+        changed="yes"
+    elif [ -e "$helper_path" ]; then
+        say "Skip helper: $display has custom helper at $helper_path"
+    fi
+
+    [ "$changed" = "yes" ] || return 0
+}
+
+upgrade_managed() {
+    local record
+    local result_count=0
+    local before
+    local output
+
+    refresh_editor_cache >/dev/null 2>&1 || true
+
+    while IFS= read -r record; do
+        output=$(upgrade_record "$record")
+        if [ -n "$output" ]; then
+            say "$output"
+            before=$result_count
+            result_count=$((before + 1))
+        fi
+    done < <(editor_records)
+
+    if [ "$result_count" -eq 0 ]; then
+        say "No installed wrappers/helpers found to upgrade."
+    else
+        refresh_editor_cache >/dev/null 2>&1 || true
+    fi
+}
+
+installed_records() {
+    local record
+    local id
+    local display
+    local installed
+
+    while IFS= read -r record; do
+        IFS='|' read -r id display installed _ <<< "$record"
+        [ "$installed" = "yes" ] && printf '%s\n' "$record"
+    done < <(editor_records)
+}
+
+render_menu() {
+    local title="$1"
+    local selected="$2"
+    shift 2
+
+    local labels=("$@")
+    local idx
+    local marker
+    local bold
+    local reset
+    local cyan
+    local dim
+    local reverse
+
+    bold=$(ansi '1')
+    reset=$(ansi '0')
+    cyan=$(ansi '36')
+    dim=$(ansi '2')
+    reverse=$(ansi '7')
+
+    clear_screen
+    splash
+    printf '\n%s%s%s\n' "$bold" "$title" "$reset"
+    printf '%sUse ↑/↓, Tab, j/k, numbers, Enter. Press q to quit/back.%s\n\n' "$dim" "$reset"
+
+    for idx in "${!labels[@]}"; do
+        if [ "$idx" -eq "$selected" ]; then
+            marker="${cyan}>${reset}"
+            printf ' %b %b%s%b\n' "$marker" "$reverse$bold" "${labels[$idx]}" "$reset"
+        else
+            printf '   %s\n' "${labels[$idx]}"
+        fi
+    done
+}
+
+read_menu_key() {
+    local key
+    local k1
+    local k2
+    local k3
+
+    MENU_KEY=""
+
+    IFS= read -rsn1 key || return 1
+    case "$key" in
+        '')
+            MENU_KEY="ENTER"
+            ;;
+        $'\t')
+            MENU_KEY="DOWN"
+            ;;
+        q|Q)
+            MENU_KEY="QUIT"
+            ;;
+        j|J)
+            MENU_KEY="DOWN"
+            ;;
+        k|K)
+            MENU_KEY="UP"
+            ;;
+        [1-9])
+            MENU_KEY="NUM:$key"
+            ;;
+        $'\033')
+            IFS= read -rsn1 -t 0.2 k1 || {
+                MENU_KEY="ESC"
+                return 0
+            }
+            case "$k1" in
+                '['|'O')
+                    IFS= read -rsn1 -t 0.2 k2 || return 0
+                    case "$k2" in
+                        A) MENU_KEY="UP" ;;
+                        B) MENU_KEY="DOWN" ;;
+                        C) MENU_KEY="DOWN" ;;
+                        D) MENU_KEY="UP" ;;
+                        [0-9])
+                            IFS= read -rsn1 -t 0.2 k3 || true
+                            case "$k2$k3" in
+                                1~|7~|H) MENU_KEY="UP" ;;
+                                4~|8~|F) MENU_KEY="DOWN" ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+select_menu() {
+    local title="$1"
+    shift
+
+    local labels=("$@")
+    local selected=0
+    local key
+    local n=${#labels[@]}
+
+    if [ "$n" -eq 0 ]; then
+        return 1
+    fi
+
+    if [ ! -t 0 ]; then
+        render_menu "$title" "$selected" "${labels[@]}"
+        printf 'Choose: '
+        IFS= read -r key || return 1
+        printf '\n'
+        case "$key" in
+            q|Q) return 1 ;;
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        if [ "$key" -ge 1 ] 2>/dev/null && [ "$key" -le "$n" ]; then
+            MENU_SELECTED=$((key - 1))
+            return 0
+        fi
+        return 1
+    fi
+
+    while true; do
+        render_menu "$title" "$selected" "${labels[@]}"
+        read_menu_key || return 1
+        case "$MENU_KEY" in
+            ENTER)
+                MENU_SELECTED=$selected
+                return 0
+                ;;
+            QUIT|ESC)
+                return 1
+                ;;
+            NUM:*)
+                key="${MENU_KEY#NUM:}"
+                if [ "$key" -le "$n" ]; then
+                    MENU_SELECTED=$((key - 1))
+                    return 0
+                fi
+                ;;
+            DOWN)
+                selected=$(((selected + 1) % n))
+                ;;
+            UP)
+                selected=$(((selected + n - 1) % n))
+                ;;
+        esac
+    done
+}
+
+terminal_main_menu() {
+    local labels=("1) View list" "2) Install / reinstall / uninstall" "3) Upgrade installed wrappers" "4) Exit")
+    local result
+
+    while true; do
+        if ! select_menu "Main menu" "${labels[@]}"; then
+            return 0
+        fi
+
+        case "$MENU_SELECTED" in
+            0)
+                terminal_view_list
+                ;;
+            1)
+                terminal_install_menu
+                ;;
+            2)
+                result=$(upgrade_managed)
+                show_text "Upgrade result" "$result"
+                ;;
+            3)
+                return 0
+                ;;
+        esac
+    done
+}
+
+terminal_record_actions() {
+    local record="$1"
+    local id
+    local display
+    local installed
+    local app
+    local wrapper
+    local helper
+    local labels
+    local result
+
+    IFS='|' read -r id display installed app _ _ _ _ _ _ _ _ _ wrapper helper _ <<< "$record"
+
+    if [ "$wrapper" = "installed" ] || [ "$helper" = "installed" ]; then
+        labels=("1) Reinstall $display" "2) Uninstall $display" "3) Back")
+        if ! select_menu "Install / reinstall / uninstall" "${labels[@]}"; then
+            return 0
+        fi
+
+        case "$MENU_SELECTED" in
+            0)
+                result=$(install_record "$record" "no" "yes")
+                show_text "Reinstall result" "$result"
+                ;;
+            1)
+                if confirm_action "Uninstall WCM wrapper/helper for $display and restore official launcher fallback?"; then
+                    result=$(uninstall_record "$record")
+                    show_text "Uninstall result" "$result"
+                fi
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+        return 0
+    fi
+
+    result=$(install_record "$record" "no")
+    show_text "Install result" "$result"
+}
+
+terminal_install_menu() {
+    while true; do
+        local labels=("0) Back" "1) Install all Windows-installed editors")
+        local records=()
+        local record
+        local id
+        local display
+        local installed
+        local app
+        local wrapper
+        local helper
+        local state
+        local result
+
+        while IFS= read -r record; do
+            records+=("$record")
+            IFS='|' read -r id display installed app _ _ _ _ _ _ _ _ _ wrapper helper _ <<< "$record"
+            if [ "$wrapper" = "installed" ] || [ "$helper" = "installed" ]; then
+                state="installed"
+            elif [ "$wrapper" = "custom" ] || [ "$helper" = "custom" ]; then
+                state="custom"
+            else
+                state="not installed"
+            fi
+            labels+=("$((${#labels[@]}))) $display ($app, $state)")
+        done < <(installed_records)
+
+        if ! select_menu "Install / reinstall / uninstall" "${labels[@]}"; then
+            return 0
+        fi
+
+        case "$MENU_SELECTED" in
+            0)
+                return 0
+                ;;
+            1)
+                result=$(install_all)
+                show_text "Install result" "$result"
+                ;;
+            *)
+                terminal_record_actions "${records[$((MENU_SELECTED - 2))]}"
+                ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<EOF
+Usage: $MANAGER_NAME [command]
+
+Commands:
+  --list              Print the full candidate list from local cache.
+  --refresh           Rescan local Windows editor installs and update cache.
+  --install <id|app>  Install one Windows-installed editor wrapper.
+  --reinstall <id|app>
+                      Reinstall one WCM installed wrapper/helper.
+  --uninstall <id|app>
+                      Remove WCM installed wrapper/helper and restore official fallback.
+  --install-all       Install wrappers for all Windows-installed editors.
+  --upgrade-installed
+                      Rewrite only WCM installed wrappers/helpers.
+  --version           Print WCM version.
+  --help              Show this help.
+
+Run without arguments to open the inline terminal UI. The shortcut command is: $SHORT_NAME
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        --list|list)
+            format_table auto
+            ;;
+        --refresh|refresh)
+            refresh_editor_cache
+            say "Local list refreshed: $RECORD_CACHE"
+            ;;
+        --install)
+            shift
+            if [ -z "${1:-}" ]; then
+                say "Error: --install needs an editor id or app name." >&2
+                return 1
+            fi
+            install_one "$1"
+            ;;
+        --reinstall|reinstall)
+            shift
+            if [ -z "${1:-}" ]; then
+                say "Error: --reinstall needs an editor id or app name." >&2
+                return 1
+            fi
+            reinstall_one "$1"
+            ;;
+        --uninstall|uninstall)
+            shift
+            if [ -z "${1:-}" ]; then
+                say "Error: --uninstall needs an editor id or app name." >&2
+                return 1
+            fi
+            uninstall_one "$1"
+            ;;
+        --install-all|install-all)
+            install_all
+            ;;
+        --upgrade-installed|upgrade-installed|--upgrade-managed|upgrade-managed|upgrade)
+            upgrade_managed
+            ;;
+        --version|-v|version)
+            printf '%s\n' "$VERSION"
+            ;;
+        --help|-h|help)
+            usage
+            ;;
+        "")
+            terminal_main_menu
+            ;;
+        *)
+            usage >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
