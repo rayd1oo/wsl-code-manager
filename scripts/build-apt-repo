@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+input_dir="${1:-$repo_dir/dist}"
+output_dir="${2:-$repo_dir/public}"
+origin="${WCM_APT_ORIGIN:-WSL Code Manager}"
+label="${WCM_APT_LABEL:-WSL Code Manager}"
+suite="${WCM_APT_SUITE:-stable}"
+codename="${WCM_APT_CODENAME:-stable}"
+component="${WCM_APT_COMPONENT:-main}"
+architectures="${WCM_APT_ARCHITECTURES:-all amd64 arm64}"
+pkg_pool="$output_dir/pool/$component/w/wsl-code-manager"
+release_dir="$output_dir/dists/$suite"
+deb_count=0
+release_tmp=""
+
+rm -rf "$output_dir"
+mkdir -p "$pkg_pool"
+
+shopt -s nullglob
+for deb in "$input_dir"/*.deb; do
+    cp "$deb" "$pkg_pool/"
+    deb_count=$((deb_count + 1))
+done
+shopt -u nullglob
+
+if [ "$deb_count" -eq 0 ]; then
+    echo "Error: no .deb files found under $input_dir" >&2
+    exit 1
+fi
+
+for arch in $architectures; do
+    binary_dir="$release_dir/$component/binary-$arch"
+    mkdir -p "$binary_dir"
+    (cd "$output_dir" && apt-ftparchive packages pool) > "$binary_dir/Packages"
+    gzip -9cn "$binary_dir/Packages" > "$binary_dir/Packages.gz"
+done
+
+release_tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-release.XXXXXX")
+(
+    cd "$release_dir"
+    apt-ftparchive \
+        -o "APT::FTPArchive::Release::Origin=$origin" \
+        -o "APT::FTPArchive::Release::Label=$label" \
+        -o "APT::FTPArchive::Release::Suite=$suite" \
+        -o "APT::FTPArchive::Release::Codename=$codename" \
+        -o "APT::FTPArchive::Release::Architectures=$architectures" \
+        -o "APT::FTPArchive::Release::Components=$component" \
+        -o "APT::FTPArchive::Release::Description=APT repository for WSL Code Manager" \
+        release .
+) > "$release_tmp"
+mv "$release_tmp" "$release_dir/Release"
+
+if [ "${WCM_APT_SIGN:-0}" = "1" ]; then
+    key_id="${WCM_GPG_KEY_ID:-}"
+    passphrase="${WCM_GPG_PASSPHRASE:-}"
+
+    if [ -z "$key_id" ]; then
+        key_id=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+    fi
+
+    if [ -z "$key_id" ]; then
+        echo "Error: WCM_APT_SIGN=1 but no GPG secret key is available." >&2
+        exit 1
+    fi
+
+    gpg_args=(--batch --yes --pinentry-mode loopback --local-user "$key_id")
+    if [ -n "$passphrase" ]; then
+        gpg_args+=(--passphrase "$passphrase")
+    fi
+
+    gpg "${gpg_args[@]}" --clearsign -o "$release_dir/InRelease" "$release_dir/Release"
+    gpg "${gpg_args[@]}" --detach-sign -o "$release_dir/Release.gpg" "$release_dir/Release"
+    gpg --batch --yes --export "$key_id" > "$output_dir/wsl-code-manager-archive-keyring.gpg"
+    gpg --batch --yes --armor --export "$key_id" > "$output_dir/wsl-code-manager-archive-keyring.asc"
+else
+    echo "Warning: APT repository generated without signatures." >&2
+fi
+
+printf '%s\n' "$output_dir"

@@ -1,0 +1,84 @@
+name: Publish APT repository
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag version
+        if: github.ref_type == 'tag'
+        run: |
+          expected="v$(tr -d '[:space:]' < VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match VERSION ${expected}" >&2
+            exit 1
+          fi
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev gnupg
+
+      - name: Import APT signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "${APT_GPG_PRIVATE_KEY}" ]; then
+            echo "Repository secret APT_GPG_PRIVATE_KEY is required to publish a signed APT repo." >&2
+            exit 1
+          fi
+          printf '%s\n' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+
+      - name: Build Debian package
+        run: scripts/build-deb
+
+      - name: Build signed APT repository
+        env:
+          WCM_APT_SIGN: "1"
+          WCM_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          WCM_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: scripts/build-apt-repo dist public
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Create or update GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.deb --clobber
+          else
+            gh release create "$tag" dist/*.deb \
+              --title "wsl-code-manager ${tag#v}" \
+              --notes "Debian package and signed APT repository for wsl-code-manager ${tag#v}."
+          fi

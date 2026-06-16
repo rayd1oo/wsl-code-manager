@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+version=$(tr -d '[:space:]' < "$repo_dir/VERSION")
+pkg_name="wsl-code-manager"
+arch="all"
+build_root="$repo_dir/dist/deb-root"
+pkg_root="$build_root/${pkg_name}_${version}_${arch}"
+deb_out="$repo_dir/dist/${pkg_name}_${version}_${arch}.deb"
+installed_size=0
+
+rm -rf "$build_root"
+mkdir -p "$pkg_root/DEBIAN" "$repo_dir/dist"
+
+install -Dm755 "$repo_dir/bin/wsl-code-manager" "$pkg_root/usr/bin/wsl-code-manager"
+ln -s wsl-code-manager "$pkg_root/usr/bin/wcm"
+install -Dm644 "$repo_dir/README.md" "$pkg_root/usr/share/doc/$pkg_name/README.md"
+install -Dm644 "$repo_dir/VERSION" "$pkg_root/usr/share/doc/$pkg_name/VERSION"
+
+installed_size=$(du -sk "$pkg_root/usr" | awk '{print $1}')
+
+cat > "$pkg_root/DEBIAN/control" <<EOF
+Package: $pkg_name
+Version: $version
+Section: utils
+Priority: optional
+Architecture: $arch
+Maintainer: Ray <rayd1oo@users.noreply.github.com>
+Depends: bash (>= 4), coreutils, findutils, grep, sed, gawk, python3
+Recommends: curl, unzip
+Installed-Size: $installed_size
+Homepage: https://github.com/rayd1oo/wsl-code-manager
+Description: WSL launcher manager for VS Code based Windows editors
+ WSL Code Manager detects VS Code based Windows editors and installs WSL-side
+ launcher wrappers for opening remote WSL windows from the terminal.
+EOF
+
+dpkg-deb --build --root-owner-group "$pkg_root" "$deb_out"
+printf '%s\n' "$deb_out"
