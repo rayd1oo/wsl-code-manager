@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="1.0.1"
+VERSION="1.0.3"
 INSTALL_DIR="${WCM_INSTALL_DIR:-$HOME/.local/bin}"
 MANAGER_NAME="wsl-code-manager"
 SHORT_NAME="wcm"
@@ -940,7 +940,7 @@ generate_editor_records() {
                 server_commit="$commit"
                 if [ "$matched_ext_id" = "$REMOTE_WSL_EXT_ID" ]; then
                     case "$app" in
-                        code|qoder|qoder-cn)
+                        code)
                             ;;
                         *)
                             compat_commit=$(vscode_compat_commit)
@@ -1309,7 +1309,7 @@ server_commit_for_wrapper() {
     primary_remote_ext_id="${remote_ext_ids%% *}"
     if [ "$primary_remote_ext_id" = "$REMOTE_WSL_EXT_ID" ]; then
         case "$app" in
-            code|qoder|qoder-cn)
+            code)
                 ;;
             *)
                 compat_commit=$(vscode_compat_commit)
@@ -1694,7 +1694,7 @@ write_wrapper() {
         printf '%s\n' ''
         printf '%s\n' 'if [ "$WCM_REMOTE_WSL_EXT_ID" = "ms-vscode-remote.remote-wsl" ]; then'
         printf '%s\n' '    case "$APP_NAME" in'
-        printf '%s\n' '        code|qoder|qoder-cn) ;;'
+        printf '%s\n' '        code) ;;'
         printf '%s\n' '        *) [ -n "$WCM_DEFAULT_SERVER_COMMIT" ] && SERVER_COMMIT="$WCM_DEFAULT_SERVER_COMMIT" ;;'
         printf '%s\n' '    esac'
         printf '%s\n' 'fi'
@@ -1749,8 +1749,16 @@ write_wrapper() {
         printf '%s\n' 'export WCM_EDITOR_VSCODE_PATH="$VSCODE_PATH"'
         printf '%s\n' 'export WCM_EDITOR_VERSIONFOLDER="$VERSIONFOLDER"'
         printf '%s\n' ''
-        printf '%s\n' '"$WSL_CODE" "$SERVER_COMMIT" "$QUALITY" "$WCM_CLIENT_COMMAND" "$APP_NAME" "$SERVERDATAFOLDER" "$@"'
-        printf '%s\n' 'exit $?'
+        printf '%s\n' 'WCM_WSL_CODE_STATUS=0'
+        printf '%s\n' '"$WSL_CODE" "$SERVER_COMMIT" "$QUALITY" "$WCM_CLIENT_COMMAND" "$APP_NAME" "$SERVERDATAFOLDER" "$@" || WCM_WSL_CODE_STATUS=$?'
+        printf '%s\n' 'if [ "$WCM_WSL_CODE_STATUS" -ne 0 ] && [ ! -x "$REMOTE_CLI" ] && [ -x "$REMOTE_CLI_DIR/code" ]; then'
+        printf '%s\n' '    ensure_remote_cli_link'
+        printf '%s\n' '    if [ -x "$REMOTE_CLI" ]; then'
+        printf '%s\n' '        "$WSL_CODE" "$SERVER_COMMIT" "$QUALITY" "$WCM_CLIENT_COMMAND" "$APP_NAME" "$SERVERDATAFOLDER" "$@"'
+        printf '%s\n' '        exit $?'
+        printf '%s\n' '    fi'
+        printf '%s\n' 'fi'
+        printf '%s\n' 'exit "$WCM_WSL_CODE_STATUS"'
     } > "$tmp"
 
     chmod +x "$tmp"
