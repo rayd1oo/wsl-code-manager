@@ -28,6 +28,8 @@ wcm --refresh
 wcm --install qoder
 wcm --reinstall cursor
 wcm --uninstall cursor
+wcm --restore cursor
+wcm --remove-wrapper cursor
 wcm --install-all
 wcm --upgrade-installed
 ```
@@ -51,6 +53,21 @@ wcm --refresh
 TUI 首页的 `View list` 会先展示上一次保存的静态列表，再用终端内刷新动画更新本地状态。
 
 `--upgrade-installed` 只重写 WCM installed wrapper/helper，不覆盖自定义脚本。它用于 WCM 模板升级后，把已安装的 wrapper 更新到新版逻辑。
+
+如果某个编辑器当前显示为 `custom`，TUI 里选中它会提供：
+
+- 覆盖安装：先把 custom wrapper/helper 备份为 `.bak.<timestamp>`，再安装 WCM wrapper。
+- 删除回官方：先备份 custom wrapper/helper，再移除本地入口，让 PATH 回落到 Windows 官方 launcher。
+- 恢复备份：把最近一次 `.bak.<timestamp>` 恢复回来；当前文件会先再次备份。
+
+CLI 对应命令：
+
+```bash
+wcm --reinstall qoder       # 显式覆盖安装，custom 会先备份
+wcm --uninstall qoder       # 卸载 WCM installed 文件，并优先恢复最近备份
+wcm --restore qoder         # 手动恢复最近备份
+wcm --remove-wrapper qoder  # 备份并移除本地 wrapper/helper，回到官方 launcher
+```
 
 ## 安装入口
 

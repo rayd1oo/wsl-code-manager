@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="1.0"
+VERSION="1.0.1"
 INSTALL_DIR="${WCM_INSTALL_DIR:-$HOME/.local/bin}"
 MANAGER_NAME="wsl-code-manager"
 SHORT_NAME="wcm"
@@ -565,6 +565,20 @@ is_wcm_file() {
     local path="$1"
     [ -e "$path" ] || return 1
     grep -q "$MARKER" "$path" 2>/dev/null || grep -q "$LEGACY_MARKER" "$path" 2>/dev/null
+}
+
+state_is_installed() {
+    case "${1:-}" in
+        installed*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+state_is_custom() {
+    case "${1:-}" in
+        custom*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 first_path_for_command() {
@@ -1746,9 +1760,86 @@ write_wrapper() {
 backup_path() {
     local path="$1"
     local ts
+    local base
+    local candidate
+    local n=1
 
     ts=$(date +%Y%m%d%H%M%S)
-    printf '%s.bak.%s\n' "$path" "$ts"
+    base="$path.bak.$ts"
+    candidate="$base"
+
+    while [ -e "$candidate" ]; do
+        candidate="$base.$n"
+        n=$((n + 1))
+    done
+
+    printf '%s\n' "$candidate"
+}
+
+latest_backup_path() {
+    local path="$1"
+    local backups=()
+
+    shopt -s nullglob
+    backups=("$path".bak.*)
+    shopt -u nullglob
+
+    [ "${#backups[@]}" -gt 0 ] || return 1
+    printf '%s\n' "${backups[@]}" | sort | tail -n 1
+}
+
+has_backup_path() {
+    latest_backup_path "$1" >/dev/null 2>&1
+}
+
+restore_latest_backup() {
+    local path="$1"
+    local kind="$2"
+    local latest
+    local backup
+
+    latest=$(latest_backup_path "$path") || return 1
+
+    if [ -e "$path" ]; then
+        backup=$(backup_path "$path")
+        mv "$path" "$backup"
+        say "Backed up current $kind before restore: $backup"
+    fi
+
+    mv "$latest" "$path"
+    say "Restored $kind backup: $latest -> $path"
+}
+
+restore_path_after_uninstall() {
+    local path="$1"
+    local kind="$2"
+
+    if restore_latest_backup "$path" "$kind"; then
+        return 0
+    fi
+
+    say "No previous $kind backup found; official launcher fallback is active."
+}
+
+remove_local_path() {
+    local path="$1"
+    local kind="$2"
+    local backup
+
+    if [ ! -e "$path" ]; then
+        say "No local $kind to remove: $path"
+        return 0
+    fi
+
+    if is_wcm_file "$path"; then
+        rm -f "$path"
+        say "Removed installed $kind: $path"
+        return 0
+    fi
+
+    backup=$(backup_path "$path")
+    mv "$path" "$backup"
+    say "Backed up and removed custom $kind: $backup"
 }
 
 install_record() {
@@ -1810,13 +1901,13 @@ install_record() {
             return 0
         fi
 
-        if ! is_wcm_file "$wrapper_path" && [ "$batch" = "yes" ]; then
+        if ! is_wcm_file "$wrapper_path" && [ "$batch" = "yes" ] && [ "$force" != "yes" ]; then
             say "Skip $display: existing custom wrapper at $wrapper_path"
             return 0
         fi
 
         if ! is_wcm_file "$wrapper_path"; then
-            if ! confirm_action "$display already has a custom wrapper. Back it up and replace it with a WCM installed wrapper?"; then
+            if [ "$force" != "yes" ] && ! confirm_action "$display already has a custom wrapper. Back it up and replace it with a WCM installed wrapper?"; then
                 say "Skip $display."
                 return 0
             fi
@@ -1828,12 +1919,12 @@ install_record() {
     fi
 
     if [ -e "$helper_path" ] && ! is_wcm_file "$helper_path"; then
-        if [ "$batch" = "yes" ]; then
+        if [ "$batch" = "yes" ] && [ "$force" != "yes" ]; then
             say "Skip $display: existing custom helper at $helper_path"
             return 0
         fi
 
-        if ! confirm_action "$display already has a custom helper. Back it up and replace it?"; then
+        if [ "$force" != "yes" ] && ! confirm_action "$display already has a custom helper. Back it up and replace it?"; then
             say "Skip $display."
             return 0
         fi
@@ -1901,6 +1992,7 @@ uninstall_record() {
     if is_wcm_file "$wrapper_path"; then
         rm -f "$wrapper_path"
         say "Removed installed wrapper: $wrapper_path"
+        restore_path_after_uninstall "$wrapper_path" "wrapper"
         removed="yes"
     elif [ -e "$wrapper_path" ]; then
         say "Left custom wrapper untouched: $wrapper_path"
@@ -1909,13 +2001,14 @@ uninstall_record() {
     if is_wcm_file "$helper_path"; then
         rm -f "$helper_path"
         say "Removed installed helper: $helper_path"
+        restore_path_after_uninstall "$helper_path" "helper"
         removed="yes"
     elif [ -e "$helper_path" ]; then
         say "Left custom helper untouched: $helper_path"
     fi
 
     if [ "$removed" = "yes" ]; then
-        say "Restored official launcher fallback for $display."
+        say "Uninstalled WCM wrapper/helper for $display."
     else
         say "No WCM installed wrapper/helper to uninstall for $display."
     fi
@@ -1934,6 +2027,82 @@ uninstall_one() {
     fi
 
     uninstall_record "$record"
+}
+
+restore_record() {
+    local record="$1"
+    local id
+    local display
+    local installed
+    local app
+    local wrapper_path
+    local helper_path
+    local restored="no"
+
+    IFS='|' read -r id display installed app _ <<< "$record"
+
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
+
+    if restore_latest_backup "$wrapper_path" "wrapper"; then
+        restored="yes"
+    else
+        say "No wrapper backup found for $display."
+    fi
+
+    if restore_latest_backup "$helper_path" "helper"; then
+        restored="yes"
+    else
+        say "No helper backup found for $display."
+    fi
+
+    [ "$restored" = "yes" ] && refresh_editor_cache >/dev/null 2>&1 || true
+}
+
+restore_one() {
+    local wanted="$1"
+    local record
+
+    record=$(record_by_id_or_app "$wanted")
+    if [ -z "$record" ]; then
+        say "Unknown editor: $wanted"
+        return 1
+    fi
+
+    restore_record "$record"
+}
+
+remove_local_record() {
+    local record="$1"
+    local id
+    local display
+    local installed
+    local app
+    local wrapper_path
+    local helper_path
+
+    IFS='|' read -r id display installed app _ <<< "$record"
+
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
+
+    remove_local_path "$wrapper_path" "wrapper"
+    remove_local_path "$helper_path" "helper"
+    say "Official launcher fallback is active for $display."
+    refresh_editor_cache >/dev/null 2>&1 || true
+}
+
+remove_local_one() {
+    local wanted="$1"
+    local record
+
+    record=$(record_by_id_or_app "$wanted")
+    if [ -z "$record" ]; then
+        say "Unknown editor: $wanted"
+        return 1
+    fi
+
+    remove_local_record "$record"
 }
 
 upgrade_record() {
@@ -2204,26 +2373,85 @@ terminal_record_actions() {
     local app
     local wrapper
     local helper
-    local labels
+    local labels=()
+    local actions=()
     local result
+    local wrapper_path
+    local helper_path
+    local has_backup="no"
+
+    add_action() {
+        actions+=("$1")
+        labels+=("$((${#labels[@]} + 1))) $2")
+    }
 
     IFS='|' read -r id display installed app _ _ _ _ _ _ _ _ _ wrapper helper _ <<< "$record"
+    wrapper_path="$INSTALL_DIR/$app"
+    helper_path="$INSTALL_DIR/$app-wsl-client"
 
-    if [ "$wrapper" = "installed" ] || [ "$helper" = "installed" ]; then
-        labels=("1) Reinstall $display" "2) Uninstall $display" "3) Back")
+    if has_backup_path "$wrapper_path" || has_backup_path "$helper_path"; then
+        has_backup="yes"
+    fi
+
+    if state_is_installed "$wrapper" || state_is_installed "$helper"; then
+        add_action reinstall "Reinstall $display"
+        add_action uninstall "Uninstall $display and restore backup if available"
+        [ "$has_backup" = "yes" ] && add_action restore "Restore latest backup"
+        add_action back "Back"
         if ! select_menu "Install / reinstall / uninstall" "${labels[@]}"; then
             return 0
         fi
 
-        case "$MENU_SELECTED" in
-            0)
+        case "${actions[$MENU_SELECTED]}" in
+            reinstall)
                 result=$(install_record "$record" "no" "yes")
                 show_text "Reinstall result" "$result"
                 ;;
-            1)
-                if confirm_action "Uninstall WCM wrapper/helper for $display and restore official launcher fallback?"; then
+            uninstall)
+                if confirm_action "Uninstall WCM wrapper/helper for $display and restore latest backup if available?"; then
                     result=$(uninstall_record "$record")
                     show_text "Uninstall result" "$result"
+                fi
+                ;;
+            restore)
+                if confirm_action "Restore latest backup for $display? Current local files will be backed up first."; then
+                    result=$(restore_record "$record")
+                    show_text "Restore result" "$result"
+                fi
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+        return 0
+    fi
+
+    if state_is_custom "$wrapper" || state_is_custom "$helper"; then
+        add_action overwrite "Install over custom $display"
+        add_action remove "Remove custom files and use official fallback"
+        [ "$has_backup" = "yes" ] && add_action restore "Restore latest backup"
+        add_action back "Back"
+        if ! select_menu "Install / reinstall / uninstall" "${labels[@]}"; then
+            return 0
+        fi
+
+        case "${actions[$MENU_SELECTED]}" in
+            overwrite)
+                if confirm_action "Back up custom files and install WCM wrapper for $display?"; then
+                    result=$(install_record "$record" "no" "yes")
+                    show_text "Install result" "$result"
+                fi
+                ;;
+            remove)
+                if confirm_action "Back up and remove custom wrapper/helper for $display so the official launcher wins?"; then
+                    result=$(remove_local_record "$record")
+                    show_text "Remove result" "$result"
+                fi
+                ;;
+            restore)
+                if confirm_action "Restore latest backup for $display? Current local files will be backed up first."; then
+                    result=$(restore_record "$record")
+                    show_text "Restore result" "$result"
                 fi
                 ;;
             *)
@@ -2254,9 +2482,9 @@ terminal_install_menu() {
         while IFS= read -r record; do
             records+=("$record")
             IFS='|' read -r id display installed app _ _ _ _ _ _ _ _ _ wrapper helper _ <<< "$record"
-            if [ "$wrapper" = "installed" ] || [ "$helper" = "installed" ]; then
+            if state_is_installed "$wrapper" || state_is_installed "$helper"; then
                 state="installed"
-            elif [ "$wrapper" = "custom" ] || [ "$helper" = "custom" ]; then
+            elif state_is_custom "$wrapper" || state_is_custom "$helper"; then
                 state="custom"
             else
                 state="not installed"
@@ -2292,9 +2520,12 @@ Commands:
   --refresh           Rescan local Windows editor installs and update cache.
   --install <id|app>  Install one Windows-installed editor wrapper.
   --reinstall <id|app>
-                      Reinstall one WCM installed wrapper/helper.
+                      Reinstall one wrapper/helper, backing up custom files first.
   --uninstall <id|app>
-                      Remove WCM installed wrapper/helper and restore official fallback.
+                      Remove WCM installed wrapper/helper and restore latest backup if available.
+  --restore <id|app> Restore the latest .bak backup for wrapper/helper.
+  --remove-wrapper <id|app>
+                      Back up and remove local wrapper/helper so the official launcher wins.
   --install-all       Install wrappers for all Windows-installed editors.
   --upgrade-installed
                       Rewrite only WCM installed wrappers/helpers.
@@ -2337,6 +2568,22 @@ main() {
                 return 1
             fi
             uninstall_one "$1"
+            ;;
+        --restore|restore)
+            shift
+            if [ -z "${1:-}" ]; then
+                say "Error: --restore needs an editor id or app name." >&2
+                return 1
+            fi
+            restore_one "$1"
+            ;;
+        --remove-wrapper|remove-wrapper|--remove-local|remove-local)
+            shift
+            if [ -z "${1:-}" ]; then
+                say "Error: --remove-wrapper needs an editor id or app name." >&2
+                return 1
+            fi
+            remove_local_one "$1"
             ;;
         --install-all|install-all)
             install_all
