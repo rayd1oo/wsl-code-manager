@@ -4,7 +4,7 @@
 
 set -u
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 INSTALL_DIR="${WCM_INSTALL_DIR:-$HOME/.local/bin}"
 MANAGER_NAME="wsl-code-manager"
 SHORT_NAME="wcm"
@@ -1204,8 +1204,11 @@ show_text() {
     pause_plain
 }
 
-refresh_with_spinner() {
-    local tmp
+run_with_spinner_to_file() {
+    local label="$1"
+    local output_file="$2"
+    shift 2
+
     local pid
     local frame
     local i=0
@@ -1215,9 +1218,8 @@ refresh_with_spinner() {
 
     dim=$(ansi '2')
     reset=$(ansi '0')
-    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-refresh.XXXXXX")
 
-    (refresh_editor_cache > "$tmp" 2>&1) &
+    ("$@" > "$output_file" 2>&1) &
     pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
@@ -1227,7 +1229,7 @@ refresh_with_spinner() {
             2) frame='-' ;;
             *) frame='\' ;;
         esac
-        printf '\r%bRefreshing local status %s%b' "$dim" "$frame" "$reset"
+        printf '\r%b%s %s%b' "$dim" "$label" "$frame" "$reset"
         i=$((i + 1))
         sleep 0.12
     done
@@ -1236,16 +1238,63 @@ refresh_with_spinner() {
     status=$?
 
     if [ "$status" -eq 0 ]; then
-        printf '\r%bRefreshing local status done%b\n' "$dim" "$reset"
+        printf '\r%b%s done%b\n' "$dim" "$label" "$reset"
     else
-        printf '\r%bRefreshing local status failed%b\n' "$dim" "$reset"
+        printf '\r%b%s failed%b\n' "$dim" "$label" "$reset"
     fi
+
+    return "$status"
+}
+
+refresh_with_spinner() {
+    local tmp
+    local status
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-refresh.XXXXXX")
+    run_with_spinner_to_file "Refreshing local status" "$tmp" refresh_editor_cache
+    status=$?
 
     if [ -s "$tmp" ]; then
         cat "$tmp"
     fi
 
     rm -f "$tmp"
+    return "$status"
+}
+
+terminal_task_with_spinner() {
+    local task_title="$1"
+    local progress_label="$2"
+    local result_title="$3"
+    shift 3
+
+    local tmp
+    local result
+    local status
+    local bold
+    local reset
+
+    bold=$(ansi '1')
+    reset=$(ansi '0')
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wcm-task.XXXXXX")
+
+    clear_screen
+    splash
+    printf '\n%s%s%s\n\n' "$bold" "$task_title" "$reset"
+
+    run_with_spinner_to_file "$progress_label" "$tmp" "$@"
+    status=$?
+
+    if [ -s "$tmp" ]; then
+        result=$(cat "$tmp")
+    elif [ "$status" -eq 0 ]; then
+        result="Done."
+    else
+        result="No output captured."
+    fi
+
+    rm -f "$tmp"
+    show_text "$result_title" "$result"
     return "$status"
 }
 
@@ -2348,7 +2397,6 @@ select_menu() {
 
 terminal_main_menu() {
     local labels=("1) View list" "2) Install / reinstall / uninstall" "3) Upgrade installed wrappers" "4) Exit")
-    local result
 
     while true; do
         if ! select_menu "Main menu" "${labels[@]}"; then
@@ -2363,8 +2411,11 @@ terminal_main_menu() {
                 terminal_install_menu
                 ;;
             2)
-                result=$(upgrade_managed)
-                show_text "Upgrade result" "$result"
+                terminal_task_with_spinner \
+                    "Upgrade installed wrappers" \
+                    "Upgrading installed wrappers" \
+                    "Upgrade result" \
+                    upgrade_managed
                 ;;
             3)
                 return 0
@@ -2383,7 +2434,6 @@ terminal_record_actions() {
     local helper
     local labels=()
     local actions=()
-    local result
     local wrapper_path
     local helper_path
     local has_backup="no"
@@ -2412,19 +2462,28 @@ terminal_record_actions() {
 
         case "${actions[$MENU_SELECTED]}" in
             reinstall)
-                result=$(install_record "$record" "no" "yes")
-                show_text "Reinstall result" "$result"
+                terminal_task_with_spinner \
+                    "Reinstall $display" \
+                    "Reinstalling $display" \
+                    "Reinstall result" \
+                    install_record "$record" "no" "yes"
                 ;;
             uninstall)
                 if confirm_action "Uninstall WCM wrapper/helper for $display and restore latest backup if available?"; then
-                    result=$(uninstall_record "$record")
-                    show_text "Uninstall result" "$result"
+                    terminal_task_with_spinner \
+                        "Uninstall $display" \
+                        "Uninstalling $display" \
+                        "Uninstall result" \
+                        uninstall_record "$record"
                 fi
                 ;;
             restore)
                 if confirm_action "Restore latest backup for $display? Current local files will be backed up first."; then
-                    result=$(restore_record "$record")
-                    show_text "Restore result" "$result"
+                    terminal_task_with_spinner \
+                        "Restore latest backup for $display" \
+                        "Restoring latest backup for $display" \
+                        "Restore result" \
+                        restore_record "$record"
                 fi
                 ;;
             *)
@@ -2446,20 +2505,29 @@ terminal_record_actions() {
         case "${actions[$MENU_SELECTED]}" in
             overwrite)
                 if confirm_action "Back up custom files and install WCM wrapper for $display?"; then
-                    result=$(install_record "$record" "no" "yes")
-                    show_text "Install result" "$result"
+                    terminal_task_with_spinner \
+                        "Install over custom $display" \
+                        "Installing $display" \
+                        "Install result" \
+                        install_record "$record" "no" "yes"
                 fi
                 ;;
             remove)
                 if confirm_action "Back up and remove custom wrapper/helper for $display so the official launcher wins?"; then
-                    result=$(remove_local_record "$record")
-                    show_text "Remove result" "$result"
+                    terminal_task_with_spinner \
+                        "Remove local files for $display" \
+                        "Removing local files for $display" \
+                        "Remove result" \
+                        remove_local_record "$record"
                 fi
                 ;;
             restore)
                 if confirm_action "Restore latest backup for $display? Current local files will be backed up first."; then
-                    result=$(restore_record "$record")
-                    show_text "Restore result" "$result"
+                    terminal_task_with_spinner \
+                        "Restore latest backup for $display" \
+                        "Restoring latest backup for $display" \
+                        "Restore result" \
+                        restore_record "$record"
                 fi
                 ;;
             *)
@@ -2469,8 +2537,11 @@ terminal_record_actions() {
         return 0
     fi
 
-    result=$(install_record "$record" "no")
-    show_text "Install result" "$result"
+    terminal_task_with_spinner \
+        "Install $display" \
+        "Installing $display" \
+        "Install result" \
+        install_record "$record" "no"
 }
 
 terminal_install_menu() {
@@ -2485,7 +2556,6 @@ terminal_install_menu() {
         local wrapper
         local helper
         local state
-        local result
 
         while IFS= read -r record; do
             records+=("$record")
@@ -2509,8 +2579,11 @@ terminal_install_menu() {
                 return 0
                 ;;
             1)
-                result=$(install_all)
-                show_text "Install result" "$result"
+                terminal_task_with_spinner \
+                    "Install all Windows-installed editors" \
+                    "Installing wrappers" \
+                    "Install result" \
+                    install_all
                 ;;
             *)
                 terminal_record_actions "${records[$((MENU_SELECTED - 2))]}"

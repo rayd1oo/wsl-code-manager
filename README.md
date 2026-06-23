@@ -50,7 +50,7 @@ wcm --refresh
 
 刷新时会优先查询 Windows 注册表的 Uninstall 项来定位编辑器安装目录，然后只检查少量固定的 `product.json` 路径；找不到时才回退到候选目录扫描。
 
-TUI 首页的 `View list` 会先展示上一次保存的静态列表，再用终端内刷新动画更新本地状态。
+TUI 首页的 `View list` 会先展示上一次保存的静态列表，再用终端内刷新动画更新本地状态。安装、卸载、恢复和 `Upgrade installed wrappers` 这类耗时动作会先进入任务页，显示 spinner，完成后展示结果。
 
 `--upgrade-installed` 只重写 WCM installed wrapper/helper，不覆盖自定义脚本。它用于 WCM 模板升级后，把已安装的 wrapper 更新到新版逻辑。
 
